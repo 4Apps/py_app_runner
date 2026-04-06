@@ -88,9 +88,8 @@ def load_config(
 
     config_dict: dict[str, Any] = dict(defaults)
 
-    # Ensure environment is set from APP_ENV
-    if "environment" not in config_dict:
-        config_dict["environment"] = appEnv
+    # Always set environment from APP_ENV
+    config_dict["environment"] = appEnv
 
     for key in environ:
         keys = key.split("_")

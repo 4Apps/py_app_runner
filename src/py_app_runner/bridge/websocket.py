@@ -121,6 +121,13 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         self.uid = str(uuid.uuid4())
         self.wb_connection_manager.user_connections.add_connection(self)
 
+        self.logger.debug(
+            "WS open uid=%s remote_ip=%s origin=%s",
+            self.uid,
+            self.request.remote_ip,
+            self.request.headers.get("Origin", "<none>"),
+        )
+
         # Validate API key from query param or header at connection time
         status = await self.has_valid_api_key()
         if status is True:
@@ -129,6 +136,7 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             self._api_key_valid = None
         else:
             self._api_key_valid = False
+            self.logger.debug("WS closing uid=%s reason=api_key_failed status=%s", self.uid, status)
             self.close(4401, f"API key validation failed: {status}")
 
     async def on_message(self, message: str | bytes) -> None:
@@ -227,6 +235,12 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         pass
 
     def on_close(self):
+        self.logger.debug(
+            "WS close uid=%s code=%s reason=%s",
+            self.uid,
+            self.close_code,
+            self.close_reason or "<none>",
+        )
         if self.uid:
             self.wb_connection_manager.user_connections.remove_connection(self)
             if self.device_id:

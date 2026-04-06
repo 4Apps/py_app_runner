@@ -33,7 +33,7 @@ jobs:
           DEST=/srv/sites/4apps.lv/www/Application/Public/apps/py
           WHEEL=$(ls dist/py_app_runner-*.whl)
           cp "$WHEEL" "$DEST/"
-          ln -sf "$(basename "$WHEEL")" "$DEST/py_app_runner-latest-py3-none-any.whl"
+          cp "$WHEEL" "$DEST/py_app_runner-0.0.0-py3-none-any.whl"
 
   cleanup:
     name: Cleanup
