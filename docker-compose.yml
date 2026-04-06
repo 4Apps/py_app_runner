@@ -1,0 +1,16 @@
+services:
+  # Development
+  develop:
+    container_name: py_app_runner_develop
+    restart: "no"
+    build:
+      context: .
+      dockerfile: ./docker/app/Dockerfile
+      target: development
+      args:
+        - GIT_NAME
+        - GIT_EMAIL
+        - LOCAL_USER_ID
+        - LOCAL_GROUP_ID
+    volumes:
+      - ./:/srv/app

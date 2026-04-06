@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools >= 61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py_app_runner"
+version = "0.1.0"
+description = "Async service framework: Tornado HTTP/WS bridge, service loader, Redis WS connection manager"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GNU General Public License v3.0 (GPL-3.0)" }
+authors = [{ name = "Gints Murans", email = "gm@gm.lv" }]
+
+dependencies = [
+    "sentry-sdk",
+    "python-dotenv",
+    "uvloop",
+    "msgspec",
+    "msgpack",
+    "tornado",
+    "database_wrapper == 0.2.27",
+    "database_wrapper[pgsql] == 0.2.27",
+    "database_wrapper[redis] == 0.2.27",
+    "psycopg",
+    "psycopg[pool]",
+    "redis",
+    "pyjwt",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyrefly",
+    "ruff",
+]
+
+[project.urls]
+Code = "https://github.com/4Apps/py_app_runner"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+fixable = ["ALL"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyrefly]
+project_includes = ["src"]
+site-package-path = "/srv/venv/lib/python3.13/site-packages"
