@@ -84,8 +84,8 @@ RUN apt-get update -y \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/cache/apt/*
 
-# Fix ownership of app dir
-RUN chown -R appuser:appuser /srv/app
+# Fix ownership of app dir and venv (builder installed packages as root)
+RUN chown -R appuser:appuser /srv/app /srv/venv
 
 # Switch to non-root user
 USER appuser
