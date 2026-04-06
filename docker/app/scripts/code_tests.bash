@@ -26,6 +26,11 @@ echo_process "Running ruff style checks... "
 ruff check src/
 echo_ok ""
 
+# Static type check with pyrefly
+echo_process "Running pyrefly static type checks... "
+pyrefly check src/
+echo_ok ""
+
 # Dependency graph sanity
 echo_process "Checking installed package dependencies... "
 pip check > /dev/null
