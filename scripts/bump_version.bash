@@ -51,6 +51,19 @@ NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
 # Update .current_version
 echo "$NEW_VERSION" > "$VERSION_FILE"
 
+# Update version in tracked files
+FILES_TO_UPDATE=(
+    "pyproject.toml"
+    "src/py_app_runner/__init__.py"
+)
+for FILE in "${FILES_TO_UPDATE[@]}"; do
+    FILEPATH="$BASE_PATH/$FILE"
+    if [ -f "$FILEPATH" ]; then
+        sed -i "s/$CURRENT_VERSION/$NEW_VERSION/g" "$FILEPATH"
+        git add "$FILEPATH"
+    fi
+done
+
 echo "  Version bumped: $CURRENT_VERSION -> $NEW_VERSION"
 
 # Stage the changed file
