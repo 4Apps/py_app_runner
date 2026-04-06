@@ -1,0 +1,45 @@
+name: Build & Publish
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create docker external network
+        run: docker network create py_app_runner_network || true
+
+      - name: Pull latest base image
+        run: docker pull debian:trixie-slim
+
+      - name: Build development image
+        run: docker compose build develop
+
+      - name: Run code tests
+        run: docker compose run --rm develop /srv/meta/scripts/code_tests.bash
+
+      - name: Build wheel
+        run: docker compose run --rm develop pip wheel /srv/app --no-deps -w /srv/app/dist
+
+      - name: Publish wheel
+        run: |
+          mkdir -p /srv/sites/4apps.lv/www/Application/Public/apps/py
+          DEST=/srv/sites/4apps.lv/www/Application/Public/apps/py
+          WHEEL=$(ls dist/py_app_runner-*.whl)
+          cp "$WHEEL" "$DEST/"
+          ln -sf "$(basename "$WHEEL")" "$DEST/py_app_runner-latest-py3-none-any.whl"
+
+  cleanup:
+    name: Cleanup
+    runs-on: self-hosted
+    needs: [build]
+    if: always()
+    steps:
+      - name: Clean up dist
+        run: rm -rf dist/
