@@ -47,9 +47,9 @@ fi
 # Run code tests (detect if inside Docker or on host)
 echo "*Running code tests... "
 if [ -f /.dockerenv ]; then
-    /srv/meta/scripts/code_tests.bash
+    /srv/app/docker/app/scripts/code_tests.bash
 else
-    docker compose run --rm develop /srv/meta/scripts/code_tests.bash
+    docker compose run --rm develop /srv/app/docker/app/scripts/code_tests.bash
 fi
 
 if [ "$?" != "0" ]; then

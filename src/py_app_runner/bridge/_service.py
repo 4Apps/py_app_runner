@@ -9,6 +9,7 @@ import socket
 import threading
 from argparse import Namespace
 from collections.abc import Awaitable, Callable
+from importlib import import_module
 
 import uvloop
 from database_wrapper_pgsql import PgsqlWithPoolingAsync
@@ -16,6 +17,7 @@ from database_wrapper_redis import RedisDbAsync, RedisDbWithPoolAsync
 from tornado import escape, httpserver, netutil, process
 from tornado.platform.asyncio import AsyncIOMainLoop
 
+from py_app_runner.bridge.web_app import WebApplication
 from py_app_runner.config import is_env_dev
 from py_app_runner.db_pools import DbPools
 from py_app_runner.pybridge import PyBridge
@@ -188,15 +190,21 @@ async def init_service(
         else:
             base_logger.info(f"No endpoint for the service: {service_name}")
 
-    # Determine which WebApplication class to use
-    web_app_cls = AppRegistry.web_app_class()
-    if web_app_cls is None:
-        from py_app_runner.bridge.web_app import WebApplication
-
-        web_app_cls = WebApplication
+    # Auto-discover project routes
+    routes = None
+    try:
+        routes_module = import_module("services.bridge.routes")
+        if hasattr(routes_module, "get_routes"):
+            routes = routes_module.get_routes()
+            base_logger.info(f"Loaded {len(routes)} route(s) from services.bridge.routes")
+        else:
+            base_logger.warning("services.bridge.routes found but missing get_routes()")
+    except ModuleNotFoundError:
+        base_logger.warning("No services.bridge.routes found — bridge has no routes")
 
     # Initialize our application
-    application = web_app_cls(
+    application = WebApplication(
+        routes=routes,
         debug=config["debug"],
         autoreload=False,
         xheaders=True,

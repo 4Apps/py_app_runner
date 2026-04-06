@@ -1,4 +1,3 @@
-from collections.abc import Callable
 from typing import Any
 
 
@@ -11,9 +10,8 @@ class AppRegistry:
     _config: dict[str, Any] = {}
     _users_model_cls: type | None = None
     _api_keys_model_cls: type | None = None
-    _audit_log_fn: Callable[..., Any] | None = None
     _redis_channel: str = ""
-    _web_app_class: type | None = None
+    _api_key_use_db: bool = False
 
     @classmethod
     def configure(
@@ -22,16 +20,14 @@ class AppRegistry:
         config: dict[str, Any],
         users_model: type,
         api_keys_model: type,
-        audit_log_fn: Callable[..., Any] | None = None,
         redis_channel: str = "",
-        web_app_class: type | None = None,
+        api_key_use_db: bool = False,
     ) -> None:
         cls._config = config
         cls._users_model_cls = users_model
         cls._api_keys_model_cls = api_keys_model
-        cls._audit_log_fn = audit_log_fn
         cls._redis_channel = redis_channel
-        cls._web_app_class = web_app_class
+        cls._api_key_use_db = api_key_use_db
 
     @classmethod
     def config(cls) -> dict[str, Any]:
@@ -50,13 +46,9 @@ class AppRegistry:
         return cls._api_keys_model_cls
 
     @classmethod
-    def audit_log_fn(cls) -> Callable[..., Any] | None:
-        return cls._audit_log_fn
-
-    @classmethod
     def redis_channel(cls) -> str:
         return cls._redis_channel
 
     @classmethod
-    def web_app_class(cls) -> type | None:
-        return cls._web_app_class
+    def api_key_use_db(cls) -> bool:
+        return cls._api_key_use_db

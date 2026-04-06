@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py_app_runner"
-version = "0.1.3"
+version = "0.1.5"
 description = "Async service framework: Tornado HTTP/WS bridge, service loader, Redis WS connection manager"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -52,6 +52,6 @@ fixable = ["ALL"]
 quote-style = "double"
 indent-style = "space"
 
+# For some reason this needs to be here to show errors in VSCode
 [tool.pyrefly]
-project_includes = ["src"]
-site-package-path = "/srv/venv/lib/python3.13/site-packages"
+site-package-path = ["/srv/venv/lib64/python3.13/site-packages"]

@@ -45,10 +45,7 @@ class ApiHandler(WebHandlerBase):
         """Get request"""
         try:
             async with self.timer.aenter("bridge.get"):
-                if self.version == 1:
-                    await self.get_v1(service=service, action=action)
-                else:
-                    raise HTTPException("Invalid version", code=1001, http_status=400)
+                await self.get_v1(service=service, action=action)
 
         except HTTPException as e:
             self.log_request(error=e)
@@ -63,7 +60,7 @@ class ApiHandler(WebHandlerBase):
             )
 
         finally:
-            self.authToken = None
+            self.auth_token = None
 
             # Print debug and free resources
             self.timer.print_timer_stats()

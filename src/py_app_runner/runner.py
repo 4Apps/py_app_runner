@@ -124,7 +124,13 @@ def main() -> None:
 
     logger.debug("Looking for services subparsers...", extra={"prefix": "\n\n"})
     for item in config["services"]:
-        service = pybridge.load_service_args(item)
+        if item == "bridge":
+            from py_app_runner.bridge import _service_args as bridge_service_args
+
+            service = bridge_service_args
+        else:
+            service = pybridge.load_service_args(item)
+
         logBuffer = f"{item}:"
 
         # Register subparser
@@ -152,7 +158,14 @@ def main() -> None:
         return
 
     logger.debug(f"\n\nLoad service: {args.service}")
-    service = pybridge.load_service_runner(args.service)
+
+    if args.service == "bridge":
+        from py_app_runner.bridge import _service as bridge_service
+
+        service = bridge_service
+    else:
+        service = pybridge.load_service_runner(args.service)
+
     if not service:
         logger.error(f'Service "{args.service}" not found!')
         return

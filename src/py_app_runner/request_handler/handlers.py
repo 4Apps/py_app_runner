@@ -70,11 +70,6 @@ class RequestHandlerBase(web.RequestHandler):
     logger: logging.Logger
     timer: Timer
 
-    # Passed in from web app
-    api_key: list[str] | str | None = None
-    api_key_use_db: bool = False
-    version: int
-
     # Temporary variables
     _current_user_obj: Any | None
     _impersonator_obj: Any | None
@@ -117,8 +112,6 @@ class RequestHandlerBase(web.RequestHandler):
         request: httputil.HTTPServerRequest,
         **kwargs: Any,
     ):
-        assert "version" in kwargs, "version is required"
-
         self.logger_name = f"{__name__}.{self.__class__.__name__}"
         self.logger = logging.getLogger(self.logger_name)
         self.timer = Timer("WebHandlerBase")
@@ -126,9 +119,6 @@ class RequestHandlerBase(web.RequestHandler):
         self.json_args = None
         self.uid = None
         self.auth_token = None
-        self.version = kwargs.pop("version")
-        self.api_key = kwargs.pop("api_key", None)
-        self.api_key_use_db = kwargs.pop("api_key_use_db", False)
         self.auth_service = AuthService(self.logger)
 
         super().__init__(application, request, **kwargs)
@@ -433,7 +423,11 @@ class RequestHandlerApiKeys(RequestHandlerBase):
         return True
 
     def has_valid_key(self, api_key: str) -> str | Literal[True]:
-        if (isinstance(self.api_key, list) and api_key in self.api_key) or api_key == self.api_key:
+        configured_key = AppRegistry.config().get("api", {}).get("key")
+        if not configured_key:
+            return "API key not configured"
+
+        if (isinstance(configured_key, list) and api_key in configured_key) or api_key == configured_key:
             return True
 
         return "Invalid API key"
@@ -448,7 +442,7 @@ class RequestHandlerApiKeys(RequestHandlerBase):
 
         api_key = str(api_key)
 
-        if self.api_key_use_db:
+        if AppRegistry.api_key_use_db():
             async with self.db_pools.main_db_pool as (pg_conn, pg_cur):
                 if not pg_cur or not pg_conn:
                     raise HTTPException("Database is not initialized")

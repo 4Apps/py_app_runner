@@ -77,7 +77,7 @@ def InitSentry(
     server_ip = socket.gethostbyname(socket.gethostname())
     with sentry_sdk.configure_scope() as scope:
         scope.set_tag("server_ip", server_ip)
-        scope.level = args.sv
+        scope.level = args.sv  # pyrefly: ignore[missing-attribute]
 
     sentry_sdk.init(
         sentry_dns,

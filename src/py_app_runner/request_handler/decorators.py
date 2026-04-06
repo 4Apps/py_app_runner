@@ -1,17 +1,15 @@
 import logging
 from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import Any, Concatenate, TypeAlias, TypeVar, cast
+from typing import Concatenate, TypeAlias, TypeVar, cast
 
 from database_wrapper_pgsql import DBWrapperPgsqlAsync
 from typing_extensions import ParamSpec
 
 from py_app_runner.http_exception import HTTPException
-from py_app_runner.registry import AppRegistry
 from py_app_runner.request_handler.handlers import RequestHandlerHelper
 
 rate_limit_logger = logging.getLogger(__name__ + ".rate_limit")
-audit_logger = logging.getLogger(__name__ + ".audit")
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -28,7 +26,7 @@ def action(name: str) -> Callable[[SyncMethod], SyncMethod]:
         cast(object, func)._action_name = name  # type: ignore[attr-defined]
 
         @wraps(func)
-        def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:
+        def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
             return func(self, *args, **kwargs)
 
         cast(object, wrapper)._action_name = name  # type: ignore[attr-defined]
@@ -39,7 +37,7 @@ def action(name: str) -> Callable[[SyncMethod], SyncMethod]:
 
 def authenticated(func: AsyncMethod) -> AsyncMethod:
     @wraps(func)
-    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:
+    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
         bh = getattr(self, "bridge_handler", None)
         if bh is None or getattr(bh, "current_user", None) is None:
             raise HTTPException("Not authorized", 4010, http_status=401)
@@ -70,7 +68,7 @@ def require_auth_for_actions(cls: T) -> T:
 
 def with_tx(func: AsyncMethod) -> AsyncMethod:
     @wraps(func)
-    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:
+    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
         pg_conn = getattr(self, "pg_conn", None)
         if pg_conn is None:
             raise HTTPException("Database connection not linked (pg_conn missing)", 5000)
@@ -83,7 +81,7 @@ def with_tx(func: AsyncMethod) -> AsyncMethod:
 
 def with_db(func: AsyncMethod) -> AsyncMethod:
     @wraps(func)
-    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:
+    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
         bh = getattr(self, "bridge_handler", None)
         if bh is None:
             raise HTTPException("Bridge handler not linked", 5000)
@@ -108,7 +106,7 @@ def with_db(func: AsyncMethod) -> AsyncMethod:
 
 def with_cache(func: AsyncMethod) -> AsyncMethod:
     @wraps(func)
-    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:
+    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
         bh = getattr(self, "bridge_handler", None)
         if bh is None:
             raise HTTPException("Bridge handler not linked", 5000)
@@ -129,7 +127,7 @@ def with_cache(func: AsyncMethod) -> AsyncMethod:
 
 def with_cache_and_db(func: AsyncMethod) -> AsyncMethod:
     @wraps(func)
-    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:
+    async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
         bh = getattr(self, "bridge_handler", None)
         if bh is None:
             raise HTTPException("Bridge handler not linked", 5000)
@@ -171,7 +169,7 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
 
     def decorator(func: AsyncMethod) -> AsyncMethod:
         @wraps(func)
-        async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:
+        async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
             redis_con = getattr(self, "redis_con", None)
             if redis_con is None:
                 rate_limit_logger.warning("rate_limit requires Redis; skipping enforcement")
@@ -207,77 +205,3 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
         return wrapper
 
     return decorator
-
-
-def audited(
-    event_type: str | None = None,
-    *,
-    sensitive_fields: tuple[str, ...] = ("password",),
-) -> Callable[[AsyncMethod], AsyncMethod]:
-    """
-    Audit-log decorator. Logs a record after the wrapped action succeeds.
-
-    Must be placed AFTER @with_db in the decorator stack (needs self.db_wrapper).
-    Place it as the innermost decorator, closest to the method body.
-
-    If *event_type* is None the action name from @action is used
-    (e.g. "create" -> stored as-is; the caller can supply a dotted name
-    like "users.create" for clarity).
-    """
-
-    def decorator(func: AsyncMethod) -> AsyncMethod:
-        @wraps(func)
-        async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:
-            result = await func(self, *args, **kwargs)
-
-            # Best-effort audit logging
-            try:
-                db_wrapper = getattr(self, "db_wrapper", None)
-                if db_wrapper is None:
-                    audit_logger.warning("@audited requires @with_db; skipping audit")
-                    return result
-
-                resolved_event = event_type or getattr(func, "_action_name", func.__name__)
-
-                bh = getattr(self, "bridge_handler", None)
-                user = getattr(bh, "current_user", None) if bh else None
-                user_id: int | None = getattr(user, "id", None)
-
-                ip: str | None = None
-                user_agent: str | None = None
-                if bh:
-                    ip = bh.request.remote_ip
-                    user_agent = bh.request.headers.get("User-Agent")
-
-                # Build details from input_data (first positional arg after self)
-                details = _sanitize_input(args[0] if args else {}, sensitive_fields)
-
-                audit_fn = AppRegistry.audit_log_fn()
-                if audit_fn is None:
-                    audit_logger.debug("No audit_log_fn configured; skipping audit")
-                    return result
-
-                await audit_fn(
-                    db_wrapper,
-                    company_id=None,
-                    event_type=resolved_event,
-                    user_id=user_id,
-                    details=details,
-                    ip=ip,
-                    user_agent=user_agent,
-                )
-            except Exception:
-                audit_logger.exception("@audited failed for event_type=%s", event_type)
-
-            return result
-
-        return wrapper
-
-    return decorator
-
-
-def _sanitize_input(input_data: Any, sensitive_fields: tuple[str, ...]) -> dict[str, Any]:
-    """Strip sensitive fields from input_data before storing in audit details."""
-    if not isinstance(input_data, dict):
-        return {}
-    return {k: "***" if k in sensitive_fields else v for k, v in input_data.items()}
