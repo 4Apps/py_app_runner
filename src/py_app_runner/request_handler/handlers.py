@@ -210,7 +210,7 @@ class RequestHandlerBase(web.RequestHandler):
         req = getattr(self, "request", None)
         method = getattr(req, "method", "?")
         path = getattr(req, "path", getattr(req, "uri", "?"))
-        headers = redact_headers(dict(getattr(req, "headers", {}) or {}))
+        headers = redact_headers({str(k): v for k, v in dict(getattr(req, "headers", {}) or {}).items()})
         args = getattr(req, "arguments", None)
         body_raw = getattr(req, "body", b"")
 

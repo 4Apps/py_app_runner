@@ -175,11 +175,21 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             if not bridge_request:
                 raise HTTPException(f"Service not found: {self.service}", code=1003, http_status=400)
 
-            # Check cached API key validation from connection handshake
+            # Check cached API key validation from connection handshake;
+            # fall back to in-message api_key (browsers cannot send custom headers on WS)
             if requires_api_key is not False:
+                if self._api_key_valid is None:
+                    in_msg_api_key = message_data.get("api_key", None)
+                    if in_msg_api_key:
+                        status = await self.has_valid_api_key(in_msg_api_key)
+                        if status is True:
+                            self._api_key_valid = True
+                        else:
+                            self._api_key_valid = False
+
                 if self._api_key_valid is not True:
                     raise HTTPException(
-                        "Application is not authenticated: API key is missing or was not provided at connection time",
+                        "Application is not authenticated: API key is missing or invalid",
                         code=1401,
                         http_status=401,
                     )
