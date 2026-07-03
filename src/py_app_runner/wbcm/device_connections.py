@@ -36,9 +36,11 @@ class DeviceConnections:
         if conn.uid in self.device_connections:
             del self.device_connections[conn.uid]
 
-        for _device_id, conn_ids in self.device_id_map.items():
+        for device_id, conn_ids in list(self.device_id_map.items()):
             if conn.uid in conn_ids:
                 conn_ids.remove(conn.uid)
+                if not conn_ids:
+                    del self.device_id_map[device_id]
                 break
 
     def reset(self) -> None:
@@ -51,7 +53,9 @@ class DeviceConnections:
         if device_id not in self.device_id_map:
             self.device_id_map[device_id] = []
 
-        self.device_id_map[device_id].append(conn_id)
+        # Callers may re-assign on every re-auth; keep one entry per connection.
+        if conn_id not in self.device_id_map[device_id]:
+            self.device_id_map[device_id].append(conn_id)
 
     def remove_device_id(self, device_id: str) -> None:
         if device_id in self.device_id_map:

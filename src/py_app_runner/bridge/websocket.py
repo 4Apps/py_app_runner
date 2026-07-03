@@ -37,6 +37,7 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         self.uid = None
         self.msg_id = None
         self.service = None
+        self.current_session_sid = None
         self.device_id: str | None = None
         self._api_key_valid: bool | None = None
 
@@ -259,6 +260,7 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             self.uid = None
         self.auth_token = None
         self.current_user = None
+        self.current_session_sid = None
 
 
 # * WebSocketHandler - JSON WebSocket handler (backward compatible)

@@ -231,11 +231,18 @@ class TickService:
         self.logger.debug("Starting process loop")
         while not self.shutdown_event.is_set():
             # Tick
+            self.logger.debug(f"Tick #{self.tick_count + 1} started")
             async with self.timer.aenter("TickService.tick"):
                 await self.tick()
 
             # Timer stats
             self.timer.print_timer_stats()
+            tick_total = self.timer.total_times.get("TickService.tick", {}).get("total", 0)
+            self.logger.debug(f"Tick #{self.tick_count} finished in {self.format_time(tick_total)}")
+
+            # Per-run timings key on run_index; without a reset the runtimes dicts
+            # grow unbounded on long-running services.
+            self.timer.reset_timers()
             self.timer.run_index += 1
 
             # Sleep

@@ -372,6 +372,13 @@ class RequestHandlerBase(web.RequestHandler):
         # Cache it for this request
         self._current_user_obj = user
 
+        # Tag WS connections with the user id so per-user pushes can reach them
+        # without every project re-wiring this in a subclass. HTTP handlers have
+        # no `uid`, so this is a no-op for them.
+        uid = getattr(self, "uid", None)
+        if uid:
+            self.wb_connection_manager.user_connections.assign_user_id(uid, str(user.id))
+
     @property
     def impersonator(self) -> Any | None:
         """Returns the superadmin identity if current request uses an impersonation token."""

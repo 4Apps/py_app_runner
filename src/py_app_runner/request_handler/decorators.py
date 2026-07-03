@@ -1,7 +1,7 @@
 import logging
 from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import Concatenate, TypeAlias, TypeVar, cast
+from typing import Any, Concatenate, TypeAlias, TypeVar, cast
 
 from database_wrapper_pgsql import DBWrapperPgsqlAsync
 from typing_extensions import ParamSpec
@@ -10,6 +10,7 @@ from py_app_runner.http_exception import HTTPException
 from py_app_runner.request_handler.handlers import RequestHandlerHelper
 
 rate_limit_logger = logging.getLogger(__name__ + ".rate_limit")
+audit_logger = logging.getLogger(__name__ + ".audit")
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -18,6 +19,9 @@ SelfT = TypeVar("SelfT", bound=RequestHandlerHelper)
 
 AsyncMethod: TypeAlias = Callable[Concatenate[SelfT, P], Awaitable[R]]
 SyncMethod: TypeAlias = Callable[Concatenate[SelfT, P], R]
+
+# Receives (db_wrapper, *, event_type, user_id, details, ip, user_agent).
+AuditSink: TypeAlias = Callable[..., Awaitable[None]]
 
 
 def action(name: str) -> Callable[[SyncMethod], SyncMethod]:
@@ -205,3 +209,80 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
         return wrapper
 
     return decorator
+
+
+def audited(
+    event_type: str | None = None,
+    *,
+    sensitive_fields: tuple[str, ...] = ("password",),
+    sink: AuditSink | None = None,
+) -> Callable[[AsyncMethod], AsyncMethod]:
+    """
+    Audit-log decorator. Records after the wrapped action succeeds.
+
+    Place it as the innermost decorator, closest to the method body; with a `sink`
+    it must come AFTER @with_db in the stack (needs self.db_wrapper). The record
+    goes to `sink(db_wrapper, event_type=..., user_id=..., details=..., ip=...,
+    user_agent=...)`; without a sink it is written to the audit logger only.
+    If *event_type* is None the action name from @action is used.
+    """
+
+    def decorator(func: AsyncMethod) -> AsyncMethod:
+        @wraps(func)
+        async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
+            result = await func(self, *args, **kwargs)
+
+            # Best-effort: an audit failure must never fail the action itself.
+            try:
+                db_wrapper = getattr(self, "db_wrapper", None)
+                if sink is not None and db_wrapper is None:
+                    audit_logger.warning("@audited with a sink requires @with_db; skipping audit")
+                    return result
+
+                resolved_event = event_type or getattr(func, "_action_name", func.__name__)
+
+                bh = getattr(self, "bridge_handler", None)
+                user = getattr(bh, "current_user", None) if bh else None
+                user_id: int | None = getattr(user, "id", None)
+
+                ip: str | None = None
+                user_agent: str | None = None
+                if bh:
+                    ip = bh.request.remote_ip
+                    user_agent = bh.request.headers.get("User-Agent")
+
+                # Build details from input_data (first positional arg after self)
+                details = _sanitize_input(args[0] if args else {}, sensitive_fields)
+
+                if sink is not None:
+                    await sink(
+                        db_wrapper,
+                        event_type=resolved_event,
+                        user_id=user_id,
+                        details=details,
+                        ip=ip,
+                        user_agent=user_agent,
+                    )
+                else:
+                    audit_logger.info(
+                        "audit event=%s user_id=%s ip=%s details=%s",
+                        resolved_event,
+                        user_id,
+                        ip,
+                        details,
+                    )
+            except Exception:
+                audit_logger.exception("@audited failed for event_type=%s", event_type)
+
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+def _sanitize_input(input_data: Any, sensitive_fields: tuple[str, ...]) -> dict[str, Any]:
+    """Strip sensitive fields from input_data before storing in audit details."""
+    if not isinstance(input_data, dict):
+        return {}
+    return {k: "***" if k in sensitive_fields else v for k, v in input_data.items()}

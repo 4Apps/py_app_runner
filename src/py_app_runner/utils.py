@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 import hashlib
 import json
@@ -9,9 +10,13 @@ import string
 from collections.abc import Callable
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
-from typing import Any, TypeGuard
+from functools import partial
+from typing import Any, ParamSpec, TypeGuard, TypeVar
 
 from msgspec import json as mjson
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 BASE64_RX = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 
@@ -262,6 +267,12 @@ def summarize_maybe_base64(s: str, preview: int = 32, hard_cap: int = 256) -> st
         tail = compact[-preview:] if len(compact) > 2 * preview else ""
         return f"<base64 {len(compact)} chars (~{approx} bytes) {head}…{tail}>"
     return truncate_middle(s, hard_cap)
+
+
+async def run_blocking(fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    """Run a blocking callable in the default executor without blocking the loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
 
 
 def redact_headers(headers: dict[str, Any]) -> dict[str, Any]:

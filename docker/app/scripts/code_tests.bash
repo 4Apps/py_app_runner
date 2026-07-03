@@ -36,4 +36,9 @@ echo_process "Checking installed package dependencies... "
 pip check > /dev/null
 echo_ok ""
 
+# Unit tests
+echo_process "Running pytest... "
+pytest tests/ -x -q
+echo_ok ""
+
 echo_success "All tests passed."

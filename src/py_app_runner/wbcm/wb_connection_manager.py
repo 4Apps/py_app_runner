@@ -21,7 +21,11 @@ class WbConnectionManager:
     cache_db: RedisDbAsync
     user_connections: UserConnections
     device_connections: DeviceConnections
-    cache_group_name: str = "WbConnectionManager"
+
+    # Plain XREAD position (not a consumer group): every manager instance reads the
+    # full stream, so forked workers each deliver to their own sockets. "$" = only
+    # messages arriving after startup; missed history is useless to dead sockets.
+    stream_last_id: str = "$"
 
     shutdown_lock: threading.Lock
 
@@ -35,7 +39,7 @@ class WbConnectionManager:
         self.cache_db = cache_db
         self.user_connections = UserConnections()
         self.device_connections = DeviceConnections()
-        self.cache_group_name = f"WbConnectionManager:{AppRegistry.config()['environment']}"
+        self.stream_last_id = "$"
 
         self.shutdown_lock = threading.Lock()
 
@@ -61,24 +65,6 @@ class WbConnectionManager:
             ...  # Ignore this exception
 
     async def start(self):
-        redis_channel = AppRegistry.redis_channel()
-
-        # We need to make sure a consumer group exists
-        self.logger.debug("Creating consumer group for WbConnectionManager")
-        async with self.connect_dbs():
-            try:
-                await self.cache_db.connection.xgroup_create(
-                    name=redis_channel,
-                    groupname=self.cache_group_name,
-                    id="0",
-                    mkstream=True,
-                )
-            except Exception as e:
-                if "BUSYGROUP Consumer Group name already exists" in str(e):
-                    self.logger.debug("Consumer group already exists")
-                else:
-                    raise
-
         self.logger.info("Starting")
         await self.tick_service.run_loop()
 
@@ -129,12 +115,10 @@ class WbConnectionManager:
             self.logger.debug("Closing DB connections")
             await self.cache_db.close()
 
-    async def read_stream_data(self, stream_name: str, latest: bool = True) -> Any:
-        self.logger.debug(f"Reading latest = {latest} data from redis")
-        return await self.cache_db.connection.xreadgroup(
-            groupname=self.cache_group_name,
-            consumername="data_stream",
-            streams={stream_name: ">" if latest else "0"},
+    async def read_stream_data(self, stream_name: str) -> Any:
+        self.logger.debug(f"Reading stream data after {self.stream_last_id}")
+        return await self.cache_db.connection.xread(
+            streams={stream_name: self.stream_last_id},
             count=500,
             block=2000,
         )
@@ -195,6 +179,32 @@ class WbConnectionManager:
                 self.device_connections.remove_connection(conn)
                 return
 
+    def close_sessions(
+        self,
+        user_id: str,
+        source_uid: str,
+        target_sid: str | None = None,
+    ) -> None:
+        """Hard-close revoked live sockets.
+
+        Closing (not just notifying) is what makes a revoke enforceable: a client
+        that ignores a notification must not keep an authenticated socket. With
+        `target_sid` only that one session's socket is closed; otherwise all of
+        the user's sockets except `source_uid`."""
+
+        connections = self.user_connections.get_connections_by_user_id(user_id)
+        for conn in connections:
+            if conn.uid == source_uid:
+                continue
+            if target_sid is not None and conn.current_session_sid != target_sid:
+                continue
+
+            try:
+                self.logger.debug(f"Closing connection {conn.uid} for user {user_id}")
+                conn.loop.call_soon_threadsafe(conn.close)
+            except Exception as e:
+                self.logger.warning(f"Failed to close connection {conn.uid}: {e}")
+
     def send_message_to_all(
         self,
         message: bytes | str | dict[str, Any] | list[Any],
@@ -224,15 +234,10 @@ class WbConnectionManager:
     ########################
 
     async def process_messages(self) -> None:
-        # First read all old data
         self.logger.debug("Find new messages in the stream")
         stream_name = AppRegistry.redis_channel()
-        cached_data = await self.read_stream_data(stream_name, False)
-        if not cached_data or not cached_data[stream_name][0]:
-            # Then read new data if no old data was found
-            cached_data = await self.read_stream_data(stream_name, True)
-
-        if not cached_data:
+        cached_data = await self.read_stream_data(stream_name)
+        if not cached_data or stream_name not in cached_data or not cached_data[stream_name][0]:
             self.logger.debug("No records found")
             return
 
@@ -244,12 +249,7 @@ class WbConnectionManager:
             if self.work(msg_data):
                 items_found_count += 1
 
-            # ACK the event message after processing
-            await self.cache_db.connection.xack(  # ! ACK
-                stream_name,
-                self.cache_group_name,
-                message_id,
-            )
+            self.stream_last_id = message_id
 
         self.logger.info(f"Processed {items_found_count} messages")
 
@@ -278,6 +278,20 @@ class WbConnectionManager:
             message_data["data"] = json_decode(data)
 
         msg_type: str = message_data.get("type", "")
+
+        # Session revocation closes sockets instead of forwarding a payload.
+        if msg_type == "session_revoked":
+            user_id = message_data.get("user_id", None)
+            if user_id is None:
+                self.logger.error(f"session_revoked without user_id: {message_data!r}")
+                return False
+
+            self.close_sessions(
+                user_id,
+                source_uid,
+                message_data.get("target_sid", None) or None,
+            )
+            return True
 
         # Session relay: route to device or user based on target_type
         if msg_type == "session_relay":

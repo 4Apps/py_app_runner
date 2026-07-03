@@ -51,5 +51,9 @@ class PyBridge:
     def cache_service(self, service_name: str, service: Any) -> None:
         self.services_placeholder[service_name] = service
 
+    def register_alias(self, name: str, handler: Any) -> None:
+        """Expose an already-loaded handler under an additional service name."""
+        self.services_placeholder[name] = handler
+
     def get_service(self, service_name: str) -> Any | Literal[False]:
         return self.services_placeholder.get(service_name, False)

@@ -10,6 +10,7 @@ import threading
 from argparse import Namespace
 from collections.abc import Awaitable, Callable
 from importlib import import_module
+from typing import Any
 
 import uvloop
 from database_wrapper_pgsql import PgsqlWithPoolingAsync
@@ -44,7 +45,7 @@ async def start_server_dev(
     autoreload.start()
 
     # Start the server
-    server = httpserver.HTTPServer(app, xheaders=True)
+    server = httpserver.HTTPServer(app, xheaders=True, max_body_size=app.settings.get("max_body_size"))
     server.listen(args.port, address=args.address)  # no fork, no reuse_port
 
     # Graceful shutdown on SIGINT/SIGTERM
@@ -80,7 +81,7 @@ async def start_server_prod(
     app.settings.update(autoreload=False)
 
     # Start the server
-    server = httpserver.HTTPServer(app, xheaders=True)
+    server = httpserver.HTTPServer(app, xheaders=True, max_body_size=app.settings.get("max_body_size"))
     server.add_sockets(sockets)
 
     # Graceful shutdown on SIGINT/SIGTERM
@@ -190,8 +191,9 @@ async def init_service(
         else:
             base_logger.info(f"No endpoint for the service: {service_name}")
 
-    # Auto-discover project routes
+    # Auto-discover project routes and optional app settings
     routes = None
+    app_settings: dict[str, Any] = {}
     try:
         routes_module = import_module("services.bridge.routes")
         if hasattr(routes_module, "get_routes"):
@@ -199,16 +201,23 @@ async def init_service(
             base_logger.info(f"Loaded {len(routes)} route(s) from services.bridge.routes")
         else:
             base_logger.warning("services.bridge.routes found but missing get_routes()")
+
+        # Projects can pass tornado Application settings (websocket_max_message_size, ...)
+        # plus max_body_size, which the server starters hand to HTTPServer.
+        if hasattr(routes_module, "get_app_settings"):
+            app_settings = routes_module.get_app_settings() or {}
+            base_logger.info(f"Loaded app settings from services.bridge.routes: {sorted(app_settings)}")
     except ModuleNotFoundError:
         base_logger.warning("No services.bridge.routes found — bridge has no routes")
 
     # Initialize our application
-    application = WebApplication(
-        routes=routes,
-        debug=config["debug"],
-        autoreload=False,
-        xheaders=True,
-    )
+    app_kwargs: dict[str, Any] = {
+        "debug": config["debug"],
+        "autoreload": False,
+        "xheaders": True,
+    }
+    app_kwargs.update(app_settings)
+    application = WebApplication(routes=routes, **app_kwargs)
     application.set_pybridge(pybridge)
 
     # Dev mode: run single process without forking

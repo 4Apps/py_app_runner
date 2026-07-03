@@ -7,6 +7,7 @@ class WebSocketHandlerInterface(ABC):
     uid: str | None
     msgId: int | None
     service: str | None
+    current_session_sid: str | None
 
     loop: AbstractEventLoop
 
@@ -15,6 +16,7 @@ class WebSocketHandlerInterface(ABC):
         self.uid = None
         self.msgId = None
         self.service = None
+        self.current_session_sid = None
 
     @abstractmethod
     def error_message(self, msg: str, code: int = -1, **kwargs: Any) -> None:

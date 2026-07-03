@@ -20,5 +20,9 @@ class WebApplication(WebApplicationBase):
 
         kwargs["handlers"] = handlers
         kwargs["debug"] = is_env_dev(AppRegistry.config())
+        # Without server pings, dead peers are never detected and writes to them
+        # buffer in memory unboundedly.
+        kwargs.setdefault("websocket_ping_interval", 30)
+        kwargs.setdefault("websocket_ping_timeout", 60)
 
         super().__init__(**kwargs)

@@ -30,16 +30,18 @@ def main() -> None:
 
     config = AppRegistry.config()
 
-    # Parse commandline arguments
-    parser = argparse.ArgumentParser(description="PyBridge services")
-    parser.add_argument(
+    # Logging flags live on a help-less pre-parser so they can be parsed before
+    # subparsers exist; `-h` is then handled only by the full parser below and
+    # renders complete per-service help.
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
         "-v",
         type=str,
         choices=["debug", "info", "warning", "error", "disable"],
         default="info",
         help="Console logging level",
     )
-    parser.add_argument(
+    pre_parser.add_argument(
         "-sv",
         type=str,
         choices=["debug", "info", "warning", "error", "disable"],
@@ -49,12 +51,14 @@ def main() -> None:
             "also if -v is set to info, and this is set to info, only errors will be reported."
         ),
     )
-    parser.add_argument(
+    pre_parser.add_argument(
         "-vf",
         type=str,
         default=None,
         help="Console logging filter by module name",
     )
+
+    parser = argparse.ArgumentParser(description="PyBridge services", parents=[pre_parser])
     parser.add_argument(
         "--interval",
         type=int,
@@ -76,7 +80,7 @@ def main() -> None:
     )
 
     # Parse args for logging output first
-    args, _unknown = parser.parse_known_args()
+    args, _unknown = pre_parser.parse_known_args()
 
     # Init logging
     consoleHandler = ConsoleHandler(filter=args.vf)

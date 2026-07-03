@@ -1,6 +1,6 @@
 import logging
 from collections.abc import ItemsView
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from py_app_runner.wbcm.ws_interface import WebSocketHandlerInterface
 
@@ -11,6 +11,8 @@ class RedisMessage(TypedDict):
     user_id: str
     source_uid: str
     data: str | bytes | None
+    # Only set for `session_revoked` messages targeting a single session.
+    target_sid: NotRequired[str]
 
 
 class UserConnections:
@@ -48,9 +50,11 @@ class UserConnections:
         if conn.uid in self.user_connections:
             del self.user_connections[conn.uid]
 
-        for _user_id, conn_id in self.user_id_map.items():
-            if conn.uid in conn_id:
-                conn_id.remove(conn.uid)
+        for user_id, conn_ids in list(self.user_id_map.items()):
+            if conn.uid in conn_ids:
+                conn_ids.remove(conn.uid)
+                if not conn_ids:
+                    del self.user_id_map[user_id]
                 break
 
     def reset(self) -> None:
@@ -64,7 +68,9 @@ class UserConnections:
         if user_id not in self.user_id_map:
             self.user_id_map[user_id] = []
 
-        self.user_id_map[user_id].append(conn_id)
+        # Callers may re-assign on every re-auth/subscribe; keep one entry per connection.
+        if conn_id not in self.user_id_map[user_id]:
+            self.user_id_map[user_id].append(conn_id)
 
         self.logger.debug(
             f"Currently we have {len(self.user_id_map)} userIds assigned"

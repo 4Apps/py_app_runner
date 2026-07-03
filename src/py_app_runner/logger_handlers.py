@@ -4,11 +4,12 @@ import sys
 import time
 from argparse import Namespace
 from difflib import SequenceMatcher
-from typing import Any, TypedDict
+from typing import TypedDict
 
 import sentry_sdk
 from sentry_sdk.integrations.redis import RedisIntegration
 from sentry_sdk.integrations.tornado import TornadoIntegration
+from sentry_sdk.types import Event, Hint
 
 from py_app_runner.registry import AppRegistry
 
@@ -36,7 +37,7 @@ logger = logging.getLogger("meta")
 #################
 
 
-def RateControl(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] | None:
+def RateControl(event: Event, hint: Hint) -> Event | None:
     if "exc_info" in hint:
         _exc_type, exc_value, _tb = hint["exc_info"]
         if isinstance(exc_value, HTTPException):
@@ -77,7 +78,10 @@ def InitSentry(
     server_ip = socket.gethostbyname(socket.gethostname())
     with sentry_sdk.configure_scope() as scope:
         scope.set_tag("server_ip", server_ip)
-        scope.level = args.sv  # pyrefly: ignore[missing-attribute]
+        scope.set_level(args.sv)
+
+    # Tracing/profiling rates come from config when a project sets them; 0 disables.
+    rates = (config.get("sentry") or {}).get("rate") or {}
 
     sentry_sdk.init(
         sentry_dns,
@@ -85,10 +89,10 @@ def InitSentry(
         environment=environment,
         server_name=server_name,
         attach_stacktrace=True,
-        before_send=RateControl,  # type: ignore
+        before_send=RateControl,
         integrations=[TornadoIntegration(), RedisIntegration()],
-        # traces_sample_rate=float(config["sentry"]["rate"]["performance"]),
-        # profiles_sample_rate=float(config["sentry"]["rate"]["profiles"]),
+        traces_sample_rate=float(rates.get("performance", 0) or 0),
+        profiles_sample_rate=float(rates.get("profiles", 0) or 0),
         ignore_errors=[KeyboardInterrupt, HTTPException],
         # debug=True,
     )
