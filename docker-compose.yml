@@ -8,9 +8,12 @@ services:
       dockerfile: ./docker/app/Dockerfile
       target: development
       args:
-        - GIT_NAME
-        - GIT_EMAIL
-        - LOCAL_USER_ID
-        - LOCAL_GROUP_ID
+        GIT_NAME: ${GIT_NAME:-}
+        GIT_EMAIL: ${GIT_EMAIL:-}
+        LOCAL_USER_ID: ${LOCAL_USER_ID:-1000}
+        LOCAL_GROUP_ID: ${LOCAL_GROUP_ID:-1000}
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./:/srv/app
