@@ -23,6 +23,21 @@ ruff format src/
 pyrefly check ./src/
 ```
 
+## Versioning
+
+`major.minor` is manual and lives in `.version`; the patch part is the git commit
+count, appended by CI at build time.
+
+- `.version` — the only place the version is declared. `pyproject.toml` reads it via
+  `[tool.setuptools.dynamic]`, so a local build reports plain `major.minor`.
+- `.github/workflows/publish.yml` rewrites `.version` to `<major.minor>.<git rev-list --count HEAD>`
+  before building, which stamps the wheel filename and package metadata. The rewrite is
+  workspace-only, never committed. Checkout needs `fetch-depth: 0` or the count is wrong.
+- `scripts/bump_version.bash [major|minor]` — bumps and stages `.version`. Nothing bumps
+  the patch part by hand.
+- `py_app_runner.__version__` resolves from installed package metadata, so it always
+  matches the wheel that was actually installed.
+
 ## Architecture
 
 ### Request Flow

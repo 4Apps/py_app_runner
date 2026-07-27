@@ -66,7 +66,7 @@ RUN apt-get update -y \
     && rm -rf /var/cache/apt/*
 
 # Install python app's runtime dependecies
-COPY ./pyproject.toml ./README.md /srv/app/
+COPY ./pyproject.toml ./README.md ./.version /srv/app/
 RUN mkdir -p /srv/app/src/py_app_runner && python3 -m pip install --no-cache-dir -e /srv/app/[dev]
 
 

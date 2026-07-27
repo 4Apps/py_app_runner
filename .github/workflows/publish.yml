@@ -11,6 +11,16 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build version
+        run: |
+          MAJOR_MINOR=$(cat .version)
+          COUNT=$(git rev-list --count HEAD)
+          VERSION="${MAJOR_MINOR}.${COUNT}"
+          echo "$VERSION" > .version
+          echo "Building py_app_runner $VERSION"
 
       - name: Create docker external network
         run: docker network create py_app_runner_network || true

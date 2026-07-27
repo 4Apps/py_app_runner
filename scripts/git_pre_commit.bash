@@ -6,7 +6,6 @@
 PLATFORM=$(uname)
 BASE_PATH="$(git rev-parse --show-toplevel)"
 COMMIT="HEAD"
-BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "detached")
 
 
 # Test non-ascii filenames
@@ -58,29 +57,6 @@ if [ "$?" != "0" ]; then
 fi
 echo " Done"
 echo
-
-
-# Bump patch version on main/master
-if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
-    echo "*On $BRANCH - bumping version..."
-    "$BASE_PATH/scripts/bump_version.bash" patch
-
-    if [ "$?" != "0" ]; then
-        echo "!!! ERROR: Version bump failed!"
-        exit 1
-    fi
-
-    # Update commit info if script exists
-    if [ -f "$BASE_PATH/scripts/update_commit_info.bash" ]; then
-        "$BASE_PATH/scripts/update_commit_info.bash"
-    fi
-
-    echo " Done"
-    echo
-else
-    echo "*Not on main/master - skipping version bump."
-    echo
-fi
 
 
 # Test for whitespace errors
