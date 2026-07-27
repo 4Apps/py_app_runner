@@ -19,7 +19,8 @@ class WebApplication(WebApplicationBase):
                 handlers.append(TornadoUrl(pattern, handler_class, name=name))
 
         kwargs["handlers"] = handlers
-        kwargs["debug"] = is_env_dev(AppRegistry.config())
+        # setdefault, so a project can override it through get_app_settings().
+        kwargs.setdefault("debug", is_env_dev(AppRegistry.config()))
         # Without server pings, dead peers are never detected and writes to them
         # buffer in memory unboundedly.
         kwargs.setdefault("websocket_ping_interval", 30)

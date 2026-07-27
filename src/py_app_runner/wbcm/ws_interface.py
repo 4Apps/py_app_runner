@@ -5,7 +5,7 @@ from typing import Any
 
 class WebSocketHandlerInterface(ABC):
     uid: str | None
-    msgId: int | None
+    msg_id: int | None
     service: str | None
     current_session_sid: str | None
 
@@ -14,7 +14,7 @@ class WebSocketHandlerInterface(ABC):
     @abstractmethod
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.uid = None
-        self.msgId = None
+        self.msg_id = None
         self.service = None
         self.current_session_sid = None
 

@@ -1,9 +1,25 @@
 import logging
 import sys
+from copy import deepcopy
 from os import environ, getcwd, path
 from typing import Any
 
 from dotenv import load_dotenv
+
+
+def coerce_value(value: Any) -> Any:
+    """Turn a plain integer string into an int, leaving everything else alone.
+
+    The round-trip check keeps values where the text form carries meaning - a zero
+    padded id or a numeric secret must not silently become a different number.
+    """
+    if isinstance(value, list) or not isinstance(value, str):
+        return value
+
+    if value.isdigit() and str(int(value)) == value:
+        return int(value)
+
+    return value
 
 
 def replace_rec(
@@ -13,14 +29,17 @@ def replace_rec(
 ) -> dict[str, Any]:
     key = keys.pop(0)
     if len(keys) == 0:
-        if not isinstance(finalValue, list) and finalValue.isdigit():
-            finalDict[key] = int(finalValue)
-        else:
-            finalDict[key] = finalValue
+        finalDict[key] = coerce_value(finalValue)
         return finalDict
 
     if key not in finalDict:
         finalDict[key] = {}
+
+    # An env var whose key path runs through an existing scalar cannot be merged
+    # (e.g. API_KEY_PEPPER against a config that already has api.key). Overwriting
+    # the scalar would silently destroy it, so refuse instead.
+    if not isinstance(finalDict[key], dict):
+        raise ValueError(f"Cannot descend into non-dict config key '{key}': it already holds a scalar value")
 
     finalDict[key] = replace_rec(keys, finalDict[key], finalValue)
     return finalDict
@@ -86,7 +105,9 @@ def load_config(
     if split_value_keys is None:
         split_value_keys = []
 
-    config_dict: dict[str, Any] = dict(defaults)
+    # Deep copy: replace_rec writes into nested dicts, which a shallow copy would
+    # share with the caller's (often module level) defaults.
+    config_dict: dict[str, Any] = deepcopy(defaults)
 
     # Always set environment from APP_ENV
     config_dict["environment"] = appEnv
@@ -99,11 +120,13 @@ def load_config(
         if len(keys) == 0 or config_dict.get(keys[0], None) is None:
             continue
 
-        if key in split_value_keys:
-            newValue = parse_splitted_values(value)
-            config_dict = replace_rec(keys, config_dict, newValue)
-            continue
+        new_value: Any = parse_splitted_values(value) if key in split_value_keys else value
 
-        config_dict = replace_rec(keys, config_dict, value)
+        try:
+            config_dict = replace_rec(keys, config_dict, new_value)
+        except ValueError as e:
+            # One unmappable variable must not take the whole service down, but it
+            # must be loud: the value the operator set is not in effect.
+            logging.getLogger(__name__).error("Ignoring env var %s: %s", key, e)
 
     return config_dict

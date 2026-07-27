@@ -47,25 +47,35 @@ def authenticated(func: AsyncMethod) -> AsyncMethod:
             raise HTTPException("Not authorized", 4010, http_status=401)
         return await func(self, *args, **kwargs)
 
+    # Marker so @require_auth_for_actions does not wrap an already-guarded method twice.
+    # functools.wraps copies __dict__ outwards, so decorators applied above this one
+    # (e.g. @action) carry the marker too.
+    cast(object, wrapper)._auth_wrapped = True  # type: ignore[attr-defined]
     return wrapper
 
 
 def require_auth_for_actions(cls: T) -> T:
     """
     Class decorator: wraps every method that has `_action_name` with @authenticated.
+
+    Walks the full MRO, not just `vars(cls)`: dispatch in RequestHandlerHelper resolves
+    actions via `dir()`, so inherited @action methods are routable and must be guarded
+    as well.
     """
 
-    for name, attr in list(vars(cls).items()):
+    for name in dir(cls):
+        attr = getattr(cls, name, None)
         action_name = getattr(attr, "_action_name", None)
-        if action_name is None:
+        if action_name is None or not callable(attr):
             continue
 
-        # Wrap only callables (methods)
-        if callable(attr):
-            # Important: keep the marker so dispatch still works
-            wrapped = authenticated(attr)  # type: ignore[reportUnknownLambdaType]
-            cast(object, wrapped)._action_name = action_name  # type: ignore[attr-defined]
-            setattr(cls, name, wrapped)
+        if getattr(attr, "_auth_wrapped", False):
+            continue
+
+        # Important: keep the marker so dispatch still works
+        wrapped = authenticated(attr)  # type: ignore[reportUnknownLambdaType]
+        cast(object, wrapped)._action_name = action_name  # type: ignore[attr-defined]
+        setattr(cls, name, wrapped)
 
     return cls
 
@@ -190,14 +200,22 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
                 identity = "unknown"
 
             action_name = getattr(func, "_action_name", func.__name__)
-            key = f"rl:{action_name}:{identity}"
+            # Scope by handler class as well: the same action name in two services
+            # would otherwise share a single bucket.
+            scope = f"{type(self).__module__}.{type(self).__qualname__}"
+            key = f"rl:{scope}:{action_name}:{identity}"
 
-            current = await redis_con.incr(key)
-            if current == 1:
+            # INCR and TTL in one round trip. Re-arming the TTL whenever it is missing
+            # also repairs keys left without an expiry by a crash between the two calls,
+            # which would otherwise lock the identity out permanently.
+            async with redis_con.pipeline(transaction=True) as pipe:
+                current, ttl = await pipe.incr(key).ttl(key).execute()
+
+            if ttl < 0:
                 await redis_con.expire(key, window_seconds)
+                ttl = window_seconds
 
             if current > max_requests:
-                ttl = await redis_con.ttl(key)
                 raise HTTPException(
                     f"Rate limit exceeded. Try again in {ttl} seconds.",
                     code=4029,

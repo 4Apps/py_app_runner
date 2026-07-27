@@ -304,6 +304,18 @@ class RequestHandlerBase(web.RequestHandler):
         else:
             self.set_header("Content-Type", "text/html; charset=UTF-8")
 
+    def _clear_current_user(self) -> None:
+        """Drop the request's user and, for WebSockets, the connection's user binding.
+
+        Leaving the binding in place would keep an unauthenticated (or re-authenticated)
+        socket in the previous user's fan-out list.
+        """
+        self._current_user_obj = None
+
+        uid = getattr(self, "uid", None)
+        if uid:
+            self.wb_connection_manager.user_connections.unassign_connection(uid)
+
     async def _ensure_current_user(self):
         # Run BEFORE get/post/etc.
         self._impersonator_obj = None
@@ -323,7 +335,7 @@ class RequestHandlerBase(web.RequestHandler):
                 token = None
 
         if not token:
-            self._current_user_obj = None
+            self._clear_current_user()
             return
 
         self.auth_token = token
@@ -339,7 +351,7 @@ class RequestHandlerBase(web.RequestHandler):
                 is_impersonation = True
 
         if not payload:
-            self._current_user_obj = None
+            self._clear_current_user()
             return
 
         user_public_id = payload["sub"]
@@ -348,7 +360,7 @@ class RequestHandlerBase(web.RequestHandler):
         try:
             UUID(user_public_id)
         except ValueError:
-            self._current_user_obj = None
+            self._clear_current_user()
             return
 
         UsersModel = AppRegistry.users_model()
@@ -366,7 +378,7 @@ class RequestHandlerBase(web.RequestHandler):
                         self._impersonator_obj = impersonator
 
         if not user or user.disabled_at or user.deleted_at:
-            self._current_user_obj = None
+            self._clear_current_user()
             return
 
         # Cache it for this request
@@ -434,8 +446,13 @@ class RequestHandlerApiKeys(RequestHandlerBase):
         if not configured_key:
             return "API key not configured"
 
-        if (isinstance(configured_key, list) and api_key in configured_key) or api_key == configured_key:
-            return True
+        # Compare as bytes: compare_digest rejects non-ASCII str, and the key comes
+        # straight from the client.
+        supplied = api_key.encode("utf-8", errors="replace")
+        candidates = configured_key if isinstance(configured_key, list) else [configured_key]
+        for candidate in candidates:
+            if hmac.compare_digest(supplied, str(candidate).encode("utf-8", errors="replace")):
+                return True
 
         return "Invalid API key"
 
@@ -500,6 +517,10 @@ class WebHandlerBase(RequestHandlerApiKeys):
     ### Request handling #####
     ##########################
     def write(self, chunk: str | bytes | dict[str, Any], wrap_in_data: bool = True):
+        if isinstance(chunk, HTTPException):
+            self.error(chunk)
+            return
+
         if isinstance(chunk, StatusModel) or isinstance(chunk, MessageModel) or isinstance(chunk, ReturnModel):
             chunk = chunk.to_dict()
 
@@ -511,8 +532,6 @@ class WebHandlerBase(RequestHandlerApiKeys):
 
             self.set_header("Content-Type", "application/json; charset=UTF-8")
             super().write(response)  # type: ignore
-        elif isinstance(chunk, HTTPException):
-            self.error(chunk)
         else:
             super().write(chunk)  # type: ignore
 
@@ -522,6 +541,8 @@ class WebHandlerBase(RequestHandlerApiKeys):
         code: int = -1,
         http_status: int = 400,
     ) -> None:
+        # `data` is the sole payload container - errors are wrapped like every other
+        # response, so HTTP and WebSocket clients parse the same shape.
         if isinstance(msg, HTTPException):
             self.set_status(msg.http_status)
             self.write({"error": msg.to_dict()})
@@ -530,8 +551,7 @@ class WebHandlerBase(RequestHandlerApiKeys):
         if http_status:
             self.set_status(http_status)
 
-        message: dict[str, Any] = {"error": {"code": code, "msg": msg}}
-        self.write(message, wrap_in_data=False)
+        self.write({"error": {"code": code, "msg": msg}})
 
 
 class RequestHandlerHelper:

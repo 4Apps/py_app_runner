@@ -8,14 +8,30 @@ from urllib.parse import urlparse
 from tornado.websocket import WebSocketHandler as TornadoWebSocketHandler
 
 from py_app_runner.bridge.encoders import JsonEncoder, MessageEncoder, MsgpackEncoder
+from py_app_runner.config import is_env_prod
 from py_app_runner.http_exception import HTTPException
+from py_app_runner.registry import AppRegistry
 from py_app_runner.request_handler.handlers import RequestHandlerApiKeys
 from py_app_runner.return_model import MessageModel, ReturnModel, StatusModel
 from py_app_runner.utils import json_encode
 from py_app_runner.wbcm.ws_interface import WebSocketHandlerInterface
 
-_ws_allowed_origins_raw = os.environ.get("WS_ALLOWED_ORIGINS", "")
-WS_ALLOWED_ORIGINS: set[str] = {o.strip().lower().rstrip("/") for o in _ws_allowed_origins_raw.split(",") if o.strip()}
+
+def allowed_ws_origins() -> set[str]:
+    """Origins accepted for WebSocket upgrades.
+
+    Read on demand rather than at import time: the value comes from the app config
+    (with an env fallback), and neither is populated when this module is imported.
+    An empty set means "accept any origin".
+    """
+    configured = AppRegistry.config().get("ws_allowed_origins")
+    if configured is None:
+        configured = os.environ.get("WS_ALLOWED_ORIGINS", "")
+
+    if isinstance(configured, str):
+        configured = configured.split(",")
+
+    return {str(o).strip().lower().rstrip("/") for o in configured if str(o).strip()}
 
 
 # * BaseWebSocketHandler - protocol-agnostic WebSocket handler
@@ -40,6 +56,7 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         self.current_session_sid = None
         self.device_id: str | None = None
         self._api_key_valid: bool | None = None
+        self._rejected_api_key: str | None = None
 
         super().__init__(*args, **kwargs)
 
@@ -73,8 +90,8 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         if wrap_in_data:
             message = {"data": message}
 
-        response_message: str | bytes = b""
-        if type(message) is dict:
+        response_message: str | bytes
+        if isinstance(message, dict):
             # Add service
             if self.service and "service" not in message:
                 message["service"] = self.service
@@ -89,10 +106,20 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             # Encode message using the pluggable encoder
             response_message = self.encoder.encode(message)
 
+        elif isinstance(message, (str, bytes)):
+            # Already-encoded payload, pass through untouched
+            response_message = message
+
+        else:
+            response_message = self.encoder.encode(message)  # type: ignore[arg-type]
+
         if self.ws_connection is not None and self.ws_connection.is_closing() is False:
             return super().write_message(response_message, binary=self.encoder.is_binary)  # type: ignore
 
-        return Future()
+        # Resolved, not dangling: callers may await the result.
+        dropped: Future[None] = Future()
+        dropped.set_result(None)
+        return dropped
 
     ########################
     ### Request handling ###
@@ -105,17 +132,24 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             await self._ensure_current_user()
 
     def check_origin(self, origin: str) -> bool:
-        if not WS_ALLOWED_ORIGINS:
+        allowed = allowed_ws_origins()
+        if not allowed:
+            if is_env_prod():
+                self.logger.warning(
+                    "ws_allowed_origins is not configured; accepting WebSocket upgrade from origin %s."
+                    " Set it to prevent cross-site WebSocket hijacking.",
+                    origin,
+                )
             return True
 
         normalized = origin.lower().rstrip("/")
-        if normalized in WS_ALLOWED_ORIGINS:
+        if normalized in allowed:
             return True
 
         # Also check just the scheme + host (ignoring path)
         parsed = urlparse(normalized)
         origin_host = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else normalized
-        return origin_host in WS_ALLOWED_ORIGINS
+        return origin_host in allowed
 
     async def open(self, *args: str, **kwargs: str) -> None:
         # Cache the connection
@@ -181,12 +215,14 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             if requires_api_key is not False:
                 if self._api_key_valid is None:
                     in_msg_api_key = message_data.get("api_key", None)
-                    if in_msg_api_key:
+                    # Remember only the last rejected key, so retrying the same bad key
+                    # costs nothing while a corrected one can still be accepted.
+                    if in_msg_api_key and in_msg_api_key != self._rejected_api_key:
                         status = await self.has_valid_api_key(in_msg_api_key)
                         if status is True:
                             self._api_key_valid = True
                         else:
-                            self._api_key_valid = False
+                            self._rejected_api_key = in_msg_api_key
 
                 if self._api_key_valid is not True:
                     raise HTTPException(

@@ -49,14 +49,17 @@ class ApiHandler(WebHandlerBase):
 
         except HTTPException as e:
             self.log_request(error=e)
-            self.error(str(e.message), e.code or -1, e.http_status)
+            self.error(e)
 
         except Exception as e:
             self.log_request(error=e)
             self.logger.exception(f"Error processing request with exception: {e}")
+            # Anything reaching here is a server-side fault, not a bad request - a 4xx
+            # would tell the client to stop retrying and hide the failure from monitoring.
             self.error(
                 "Found an error while processing your request. Please try again later."
-                " Send us a message if the problem persists."
+                " Send us a message if the problem persists.",
+                http_status=500,
             )
 
         finally:
@@ -128,4 +131,8 @@ class ApiHandler(WebHandlerBase):
                 self.write(return_data)
                 self.log_request(response=return_data, level="debug")
             else:
-                raise HTTPException("No return data from service", code=1006, http_status=400)
+                # A service that returns nothing produced no payload, which is not an
+                # error - the WebSocket path stays silent in the same case. 204 has no
+                # body, so nothing must be written here.
+                self.set_status(204)
+                self.log_request(level="debug")

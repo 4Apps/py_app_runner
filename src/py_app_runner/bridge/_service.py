@@ -25,7 +25,7 @@ from py_app_runner.db_pools import DbPools
 from py_app_runner.pybridge import PyBridge
 from py_app_runner.registry import AppRegistry
 from py_app_runner.request_handler.handlers import WebApplicationBase
-from py_app_runner.utils import json_decode, json_encode, workers_auto
+from py_app_runner.utils import json_decode, json_encode, run_blocking, workers_auto
 from py_app_runner.wbcm.wb_connection_manager import WbConnectionManager
 
 ServerStarter = Callable[
@@ -129,7 +129,9 @@ async def child_process_initializer(
     # Init connection manager
     wb_redis = RedisDbAsync(config["db"]["redis"])
     cm = WbConnectionManager(cache_db=wb_redis, debug=args.debug_wbcm)
-    bg_thread = threading.Thread(target=cm.start_in_new_loop)
+    # Daemon: a wedged manager must not keep the process alive after the join below
+    # gives up.
+    bg_thread = threading.Thread(target=cm.start_in_new_loop, name="wbcm", daemon=True)
     bg_thread.start()
     application.set_wb_connection_manager(cm)
 
@@ -141,7 +143,12 @@ async def child_process_initializer(
     finally:
         # Stop processing messages, thus stopping the background thread
         await cm.stop()
-        bg_thread.join()
+
+        # join() blocks; keep it off the event loop and bounded so a stuck manager
+        # cannot hang the shutdown.
+        await run_blocking(bg_thread.join, 10.0)
+        if bg_thread.is_alive():
+            base_logger.warning("WbConnectionManager thread did not stop in time")
 
         # Close the database pools
         await redisPool.close()
@@ -208,12 +215,16 @@ async def init_service(
         if hasattr(routes_module, "get_app_settings"):
             app_settings = routes_module.get_app_settings() or {}
             base_logger.info(f"Loaded app settings from services.bridge.routes: {sorted(app_settings)}")
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as e:
+        # Only swallow "the routes module itself is absent". A missing import *inside*
+        # routes.py must not be reported as "no routes" and start a bridge that serves
+        # nothing.
+        if e.name not in ("services", "services.bridge", "services.bridge.routes"):
+            raise
         base_logger.warning("No services.bridge.routes found — bridge has no routes")
 
     # Initialize our application
     app_kwargs: dict[str, Any] = {
-        "debug": config["debug"],
         "autoreload": False,
         "xheaders": True,
     }

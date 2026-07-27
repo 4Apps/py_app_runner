@@ -49,7 +49,7 @@ def RateControl(event: Event, hint: Hint) -> Event | None:
 
     now = int(time.time())
     current_event = str(event)
-    test = SequenceMatcher(None, [last_error["msg"]], current_event).ratio()
+    test = SequenceMatcher(None, last_error["msg"], current_event).ratio()
     if last_error["time"] == 0 or now - int(last_error["time"]) >= ERROR_RATE or test < 0.4:
         sys.stderr.write("#### Allowing Sentry to send error message\n")
         last_error["count"] = 0
@@ -106,13 +106,15 @@ def InitSentry(
 class ConsoleHandler(logging.Handler):
     name_filter: str | None
 
+    should_buffer: bool
+    the_buffer: list[logging.LogRecord]
+
     def __init__(self, filter: str | None = None, level: int = logging.NOTSET):
         super().__init__(level)
 
         self.name_filter = filter
-
-    should_buffer: bool = False
-    the_buffer: list[logging.LogRecord] = []
+        self.should_buffer = False
+        self.the_buffer = []
 
     def emit_buffer(self) -> None:
         self.should_buffer = False

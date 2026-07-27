@@ -5,10 +5,11 @@ from py_app_runner.db_pools import DbPools
 
 
 class PyBridge:
-    services_placeholder: dict[str, Any] = {}
+    services_placeholder: dict[str, Any]
     db_pools: DbPools
 
-    def __init__(self) -> None: ...
+    def __init__(self) -> None:
+        self.services_placeholder = {}
 
     def load_service(self, service_name: str) -> Any:
         try:

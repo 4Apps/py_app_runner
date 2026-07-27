@@ -114,7 +114,9 @@ Other decorators:
 - `@with_cache` — inject `self.redis_con`
 - `@with_cache_and_db` — both Redis + PostgreSQL
 - `@rate_limit(max_requests, window_seconds)` — Redis-backed rate limiter (MUST come after @with_cache)
-- `@require_auth_for_actions` — class decorator, applies `@authenticated` to all @action methods
+- `@require_auth_for_actions` — class decorator, applies `@authenticated` to all @action
+  methods, inherited ones included (dispatch resolves actions across the MRO, so
+  guarding only the class's own methods would leave base-class actions open)
 
 ## Error Handling
 
@@ -133,6 +135,17 @@ Success responses:
 ```
 
 The `data` field is the sole payload container — `msg_id` and `service` are protocol envelope only.
+
+This holds for HTTP too: `WebHandlerBase.error()` wraps both `HTTPException` and plain
+string errors in `data`, so an HTTP client parses `data.error` exactly like a WebSocket
+client. The HTTP status still carries `http_status` from the exception.
+
+HTTP status codes from `ApiHandler`:
+
+- `HTTPException` → its own `http_status`
+- any other exception → `500` (a server-side fault, never a 4xx)
+- action returns `None` → `204` with no body, mirroring the WebSocket path, which
+  simply sends nothing in the same case
 
 ## WebSocket Protocol
 
@@ -169,6 +182,26 @@ Projects integrate by:
 3. **`src/services/<name>/_service_pybridge.py`** — Export `bridge_request(action, request_data, bridge_handler)`.
 4. **Handler classes** — Extend `RequestHandlerHelper`, use `@action` + decorator stack.
 5. **Optional overrides**: custom `WebSocketHandler` (extends `BaseWebSocketHandler`), custom `WebApplication` (extends `WebApplication`).
+
+**`RequestHandlerHelper` instances are per-request.** `handle_request()` stores
+`bridge_handler` on `self`, and `@with_db` / `@with_cache` attach and then delete
+`pg_conn` / `pg_cur` / `db_wrapper` / `redis_con` on `self`. Construct a fresh handler
+inside `bridge_request()`; a module-level singleton would let concurrent requests
+overwrite each other's connections, transactions and `current_user`.
+
+### Config keys the framework reads
+
+- `api.key` (str or list) — static API key(s) when `api_key_use_db=False`
+- `api_key_pepper` — pepper for hashed API keys when `api_key_use_db=True`
+- `jwt.secret` — HS256 signing secret
+- `ws_allowed_origins` (str or list) — accepted WebSocket `Origin` values; falls back to
+  the `WS_ALLOWED_ORIGINS` env var. Empty means accept any origin, which logs a warning
+  in prod.
+- `sentry.dsn`, `sentry.rate.performance`, `sentry.rate.profiles`
+
+Note the env-var mapping splits on `_`, so a nested key path must not run through a key
+that already holds a scalar (`API_KEY_PEPPER` cannot coexist with `api.key`). Such a
+variable is logged and skipped rather than silently clobbering the scalar.
 
 ## Key Paths
 

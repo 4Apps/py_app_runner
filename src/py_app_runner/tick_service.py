@@ -190,7 +190,9 @@ class TickService:
         [task.cancel() for task in tasks]
 
         logging.debug(f"Cancelling {len(tasks)} outstanding tasks")
-        await asyncio.gather(*tasks)
+        # return_exceptions: the CancelledError we just caused would otherwise
+        # propagate here and abort the rest of the shutdown.
+        await asyncio.gather(*tasks, return_exceptions=True)
         logging.debug("All outstanding tasks are cancelled")
 
         # Remove callback handlers to avoid circular references
@@ -251,9 +253,27 @@ class TickService:
 
         self.logger.debug("Process loop is stopped")
 
-    async def stop_loop(self) -> None:
+    async def stop_loop(self, timeout: float = 10.0) -> None:
+        """Ask the loop to stop and wait for the shutdown to finish.
+
+        Safe to call from another thread's event loop: the coroutine is scheduled on
+        the loop that owns this service and awaited from the caller's loop.
+        """
         self.logger.debug("Stopping process loop")
-        asyncio.run_coroutine_threadsafe(self.shutdown(SIGTERM), self.current_loop)
+
+        current_loop = getattr(self, "current_loop", None)
+        if current_loop is None or current_loop.is_closed():
+            self.logger.debug("Loop was never started or is already closed")
+            self.shutdown_event.set()
+            return
+
+        future = asyncio.run_coroutine_threadsafe(self.shutdown(SIGTERM), current_loop)
+        try:
+            await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+        except TimeoutError:
+            self.logger.warning(f"Shutdown did not finish within {timeout}s, continuing anyway")
+        except Exception as e:
+            self.logger.warning(f"Shutdown failed: {e}")
 
     ####################
     ### Tick methods ###

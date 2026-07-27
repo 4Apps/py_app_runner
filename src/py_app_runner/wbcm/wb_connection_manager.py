@@ -75,15 +75,18 @@ class WbConnectionManager:
     async def shutdown(self):
         self.logger.debug("Stop the event loop")
 
-        for _conn_id, conn in self.user_connections.items():
+        # We run on the manager's background thread; the sockets belong to the web
+        # server's loop. Closing them directly is not thread safe, and iterating the
+        # live dict would break as on_close() removes entries from it.
+        for _conn_id, conn in list(self.user_connections.items()):
             try:
-                conn.close()
+                conn.loop.call_soon_threadsafe(conn.close)
             except Exception:
                 pass
 
-        for _conn_id, conn in self.device_connections.items():
+        for _conn_id, conn in list(self.device_connections.items()):
             try:
-                conn.close()
+                conn.loop.call_soon_threadsafe(conn.close)
             except Exception:
                 pass
 
@@ -151,7 +154,7 @@ class WbConnectionManager:
             except Exception as e:
                 self.logger.warning(f"Removing connection {conn.uid} for exception {e}")
                 self.user_connections.remove_connection(conn)
-                return
+                continue
 
     def send_message_to_device(
         self,
@@ -177,7 +180,7 @@ class WbConnectionManager:
             except Exception as e:
                 self.logger.warning("Removing device connection %s for exception %s", conn.uid, e)
                 self.device_connections.remove_connection(conn)
-                return
+                continue
 
     def close_sessions(
         self,
@@ -211,7 +214,8 @@ class WbConnectionManager:
         source_uid: str,
     ) -> None:
         self.logger.debug("Sending message to all")
-        for _user_id, conn in self.user_connections.items():
+        # Snapshot: the loop below removes dead connections from the same dict.
+        for _user_id, conn in list(self.user_connections.items()):
             # Skip the source connection
             if conn.uid == source_uid:
                 self.logger.debug(f"Skipping source connection {source_uid}")
@@ -246,8 +250,13 @@ class WbConnectionManager:
 
         self.logger.info(f"Processing {len(message_data)} records")
         for message_id, msg_data in message_data:
-            if self.work(msg_data):
-                items_found_count += 1
+            # A raising message must never hold up the stream position, otherwise the
+            # same batch is re-read on every tick forever.
+            try:
+                if self.work(msg_data):
+                    items_found_count += 1
+            except Exception:
+                self.logger.exception(f"Failed to process message {message_id!r}, skipping it")
 
             self.stream_last_id = message_id
 
@@ -275,7 +284,11 @@ class WbConnectionManager:
         source_uid: str = message_data.get("source_uid", "")
         data = message_data.get("data", None)
         if data is not None and isinstance(data, str):
-            message_data["data"] = json_decode(data)
+            try:
+                message_data["data"] = json_decode(data)
+            except Exception:
+                self.logger.exception(f"Message data is not valid JSON, dropping: {message_data!r}")
+                return False
 
         msg_type: str = message_data.get("type", "")
 

@@ -15,6 +15,9 @@ def _msgpack_default(obj: Any) -> Any:
         return float(obj)
 
     if isinstance(obj, dt.datetime):
+        # Normalize to UTC: the wire format carries no offset.
+        if obj.tzinfo is not None:
+            obj = obj.astimezone(dt.UTC).replace(tzinfo=None)
         return obj.strftime("%Y-%m-%dT%H:%M:%S")
 
     if isinstance(obj, dt.date):

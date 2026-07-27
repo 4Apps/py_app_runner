@@ -50,12 +50,23 @@ class UserConnections:
         if conn.uid in self.user_connections:
             del self.user_connections[conn.uid]
 
+        self.unassign_connection(conn.uid)
+
+    def unassign_connection(self, conn_id: str, keep_user_id: str | None = None) -> None:
+        """Drop `conn_id` from every user's fan-out list except `keep_user_id`.
+
+        A socket can re-authenticate as a different user mid-connection; without this
+        it would stay in the previous user's list and keep receiving that user's
+        messages. No early exit: the connection may be present under several ids.
+        """
+
         for user_id, conn_ids in list(self.user_id_map.items()):
-            if conn.uid in conn_ids:
-                conn_ids.remove(conn.uid)
+            if user_id == keep_user_id:
+                continue
+            if conn_id in conn_ids:
+                conn_ids.remove(conn_id)
                 if not conn_ids:
                     del self.user_id_map[user_id]
-                break
 
     def reset(self) -> None:
         self.logger.debug("Resetting user connections")
@@ -65,6 +76,10 @@ class UserConnections:
     def assign_user_id(self, conn_id: str, user_id: str) -> None:
         self.logger.debug(f"Assigning userId {user_id} to conn_id {conn_id}")
         user_id = str(user_id)
+
+        # A connection belongs to exactly one user at a time.
+        self.unassign_connection(conn_id, keep_user_id=user_id)
+
         if user_id not in self.user_id_map:
             self.user_id_map[user_id] = []
 

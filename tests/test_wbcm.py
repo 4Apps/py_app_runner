@@ -159,3 +159,154 @@ class TestStreamFanOut:
         assert cm.stream_last_id == "$"
         asyncio.run(cm.process_messages())
         assert cm.stream_last_id == "1-2"
+
+
+class TestReAuthRebinding:
+    def test_reassigning_user_drops_the_previous_binding(self):
+        # A socket that re-authenticates as another user must not keep receiving the
+        # previous user's messages.
+        uc = UserConnections()
+        conn = FakeConn("a")
+        uc.add_connection(conn)
+        uc.assign_user_id("a", "1")
+        uc.assign_user_id("a", "2")
+
+        assert uc.get_connections_by_user_id("1") == []
+        assert uc.get_connections_by_user_id("2") == [conn]
+        assert "1" not in uc.user_id_map
+
+    def test_unassign_connection_clears_all_bindings(self):
+        uc = UserConnections()
+        conn = FakeConn("a")
+        uc.add_connection(conn)
+        uc.assign_user_id("a", "1")
+        uc.unassign_connection("a")
+
+        assert uc.user_id_map == {}
+        assert "a" in uc.user_connections
+
+    def test_remove_connection_leaves_no_stale_entries(self):
+        uc = UserConnections()
+        conn_a = FakeConn("a")
+        conn_b = FakeConn("b")
+        for conn in (conn_a, conn_b):
+            uc.add_connection(conn)
+        uc.assign_user_id("a", "1")
+        uc.assign_user_id("b", "1")
+        uc.assign_user_id("a", "2")
+
+        uc.remove_connection(conn_a)
+        assert uc.user_id_map == {"1": ["b"]}
+
+    def test_device_reassignment_drops_previous_binding(self):
+        dc = DeviceConnections()
+        conn = FakeConn("a")
+        dc.add_connection(conn)
+        dc.assign_device_id("a", "dev1")
+        dc.assign_device_id("a", "dev2")
+
+        assert dc.get_connections_by_device_id("dev1") == []
+        assert dc.get_connections_by_device_id("dev2") == [conn]
+
+
+class BrokenLoop:
+    def call_soon_threadsafe(self, fn, *args):
+        raise RuntimeError("loop is closed")
+
+
+class TestFanOutResilience:
+    def test_one_dead_connection_does_not_stop_delivery(self):
+        cm = make_manager()
+        dead = FakeConn("dead")
+        dead.loop = BrokenLoop()  # type: ignore[assignment]
+        alive = FakeConn("alive")
+        for conn in (dead, alive):
+            cm.user_connections.add_connection(conn)
+            cm.user_connections.assign_user_id(conn.uid, "1")
+
+        cm.send_message("1", {"hello": "world"}, "src")
+
+        assert alive.messages == [{"hello": "world"}]
+        assert "dead" not in cm.user_connections.user_connections
+
+    def test_send_to_all_survives_removal_during_iteration(self):
+        cm = make_manager()
+        dead = FakeConn("dead")
+        dead.loop = BrokenLoop()  # type: ignore[assignment]
+        alive = FakeConn("alive")
+        for conn in (dead, alive):
+            cm.user_connections.add_connection(conn)
+
+        cm.send_message_to_all({"hello": "all"}, "src")
+
+        assert alive.messages == [{"hello": "all"}]
+        assert "dead" not in cm.user_connections.user_connections
+
+    def test_device_fan_out_continues_past_dead_connection(self):
+        cm = make_manager()
+        dead = FakeConn("dead")
+        dead.loop = BrokenLoop()  # type: ignore[assignment]
+        alive = FakeConn("alive")
+        for conn in (dead, alive):
+            cm.device_connections.add_connection(conn)
+            cm.device_connections.assign_device_id(conn.uid, "dev1")
+
+        cm.send_message_to_device("dev1", {"ping": 1}, "src")
+
+        assert alive.messages == [{"ping": 1}]
+
+
+class TestPoisonMessages:
+    def test_undecodable_data_is_dropped_not_raised(self):
+        cm = make_manager()
+        message = {
+            "service": "s",
+            "type": "t",
+            "data": "{not json",
+            "user_id": "1",
+            "source_uid": "src",
+        }
+        assert cm.work(message) is False
+
+    def test_failing_message_still_advances_the_stream(self):
+        # Otherwise the same batch is re-read on every tick forever.
+        configure_registry()
+        entries = [
+            ("1-1", {"service": "s", "type": "t", "data": "{}", "user_id": "1", "source_uid": "src"}),
+            ("1-2", {"service": "s", "type": "t", "data": "{}", "user_id": "1", "source_uid": "src"}),
+        ]
+        cache_db = MagicMock()
+        cache_db.connection.xread = AsyncMock(return_value={TEST_STREAM: [entries]})
+        cm = WbConnectionManager(cache_db=cache_db)
+
+        def explode(message_data: Any) -> bool:
+            raise RuntimeError("boom")
+
+        cm.work = explode  # type: ignore[assignment]
+        asyncio.run(cm.process_messages())
+
+        assert cm.stream_last_id == "1-2"
+
+
+class TestShutdown:
+    def test_shutdown_closes_sockets_on_their_own_loop(self):
+        # Sockets belong to the web server's loop; the manager runs on a background
+        # thread and must hand the close over rather than calling it directly.
+        cm = make_manager()
+        scheduled: list[Any] = []
+
+        class RecordingLoop:
+            def call_soon_threadsafe(self, fn, *args):
+                scheduled.append(fn)
+                fn(*args)
+
+        conn = FakeConn("a")
+        conn.loop = RecordingLoop()  # type: ignore[assignment]
+        cm.user_connections.add_connection(conn)
+        cm.user_connections.assign_user_id("a", "1")
+
+        asyncio.run(cm.shutdown())
+
+        assert scheduled == [conn.close]
+        assert conn.closed
+        assert cm.user_connections.user_connections == {}

@@ -35,8 +35,11 @@ def json_encoder(obj: Any) -> str | float | None:
         return float(obj)
 
     if isinstance(obj, dt.datetime):
-        # * NOTE: Could also do this:
-        # * return obj.astimezone(dt.timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S")
+        # The wire format carries no offset, so an aware value must be normalized to
+        # UTC first - formatting it as-is would emit a local wall clock time that the
+        # client has no way to interpret.
+        if obj.tzinfo is not None:
+            obj = obj.astimezone(dt.UTC).replace(tzinfo=None)
         return obj.strftime("%Y-%m-%dT%H:%M:%S")
 
     if isinstance(obj, dt.date):
@@ -183,6 +186,9 @@ def replace_strings(
 
 
 def create_valid_hostname(input_string: str) -> str:
+    if not input_string:
+        return ""
+
     # Replace spaces with hyphens
     input_string = input_string.replace(" ", "-")
     input_string = input_string.replace("_", "-")
@@ -192,10 +198,7 @@ def create_valid_hostname(input_string: str) -> str:
     input_string = re.sub(r"[^a-zA-Z0-9-]+", "", input_string)
 
     # Ensure that the first and last characters are not hyphens
-    if input_string[0] == "-":
-        input_string = input_string[1:]
-    if input_string[-1] == "-":
-        input_string = input_string[:-1]
+    input_string = input_string.strip("-")
 
     # Return the valid hostname
     return input_string
