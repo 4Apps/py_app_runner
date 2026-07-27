@@ -38,6 +38,11 @@ count, appended by CI at build time.
 - `py_app_runner.__version__` resolves from installed package metadata, so it always
   matches the wheel that was actually installed.
 
+Publishing: the runner is on processing, so the workflow scp's the wheel to
+`services@4apps.lv:/srv/sites/4apps.lv/www/Application/Public/apps/py/` and repoints the
+`py_app_runner-latest-py3-none-any.whl` symlink at it. Downstream projects pin an exact
+versioned wheel URL, so publishing never changes what an existing project resolves.
+
 ## Architecture
 
 ### Request Flow

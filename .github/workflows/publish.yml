@@ -20,6 +20,7 @@ jobs:
           COUNT=$(git rev-list --count HEAD)
           VERSION="${MAJOR_MINOR}.${COUNT}"
           echo "$VERSION" > .version
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Building py_app_runner $VERSION"
 
       - name: Create docker external network
@@ -35,15 +36,21 @@ jobs:
         run: docker compose run --rm develop /srv/meta/scripts/code_tests.bash
 
       - name: Build wheel
-        run: docker compose run --rm develop pip wheel /srv/app --no-deps -w /srv/app/dist
-
-      - name: Publish wheel
         run: |
-          mkdir -p /srv/sites/4apps.lv/www/Application/Public/apps/py
-          DEST=/srv/sites/4apps.lv/www/Application/Public/apps/py
-          WHEEL=$(ls dist/py_app_runner-*.whl)
-          cp "$WHEEL" "$DEST/"
-          cp "$WHEEL" "$DEST/py_app_runner-0.0.0-py3-none-any.whl"
+          rm -rf build dist
+          docker compose run --rm develop pip wheel /srv/app --no-deps -w /srv/app/dist
+
+      # The runner lives on processing, the wheels are served from 4apps.lv
+      - name: Publish wheel
+        env:
+          PUBLISH_HOST: services@4apps.lv
+          PUBLISH_DIR: /srv/sites/4apps.lv/www/Application/Public/apps/py
+        run: |
+          NAME="py_app_runner-${VERSION}-py3-none-any.whl"
+          scp -o BatchMode=yes "dist/$NAME" "$PUBLISH_HOST:$PUBLISH_DIR/$NAME"
+          ssh -o BatchMode=yes "$PUBLISH_HOST" \
+            "ln -sfn '$NAME' '$PUBLISH_DIR/py_app_runner-latest-py3-none-any.whl'"
+          echo "Published $NAME"
 
   cleanup:
     name: Cleanup
