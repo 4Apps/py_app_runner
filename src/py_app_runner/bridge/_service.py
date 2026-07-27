@@ -4,6 +4,7 @@ Bridge service should be treated as a transport layer for the other services.
 
 import asyncio
 import logging
+import os
 import signal
 import socket
 import threading
@@ -228,11 +229,26 @@ async def init_service(
 
     # Bind sockets and start processes
     sockets = netutil.bind_sockets(args.port, address=args.address, reuse_port=True)
+
+    # The parent typically runs as container PID 1, which ignores signals with no
+    # handler installed - `docker stop` would hang and end in SIGKILL. Forward
+    # TERM/INT to the process group so the children shut down gracefully.
+    def _forward_to_children(signum: int, frame: Any) -> None:
+        signal.signal(signum, signal.SIG_IGN)  # killpg below also targets ourselves
+        os.killpg(0, signum)
+
+    signal.signal(signal.SIGTERM, _forward_to_children)
+    signal.signal(signal.SIGINT, _forward_to_children)
+
     process.fork_processes(workers_auto() if not config["debug"] else 1)
 
-    # Parent exits quickly; children continue
-    if process.task_id() is None:
-        base_logger.info(f"Web service listening on {args.address}:{args.port}")
+    # Children continue past the fork; restore default handling so the asyncio
+    # signal handlers installed by the server starter are the only ones active.
+    if process.task_id() is not None:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        asyncio.run(child_process_initializer(application, args, base_logger, sockets, start_server_prod))
         return
 
-    asyncio.run(child_process_initializer(application, args, base_logger, sockets, start_server_prod))
+    # Parent: fork_processes only returns here once all children have exited.
+    base_logger.info("Web service parent exiting (all children stopped)")
