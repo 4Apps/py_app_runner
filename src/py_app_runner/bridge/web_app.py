@@ -23,7 +23,9 @@ class WebApplication(WebApplicationBase):
         kwargs.setdefault("debug", is_env_dev(AppRegistry.config()))
         # Without server pings, dead peers are never detected and writes to them
         # buffer in memory unboundedly.
+        # Tornado clamps the timeout to the interval, so a larger value here would be
+        # discarded and logged as a warning.
         kwargs.setdefault("websocket_ping_interval", 30)
-        kwargs.setdefault("websocket_ping_timeout", 60)
+        kwargs.setdefault("websocket_ping_timeout", 30)
 
         super().__init__(**kwargs)
