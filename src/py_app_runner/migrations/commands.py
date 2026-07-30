@@ -250,9 +250,19 @@ async def cmd_baseline(
             elif answer == "y":
                 chosen.append(state)
 
-        for state in chosen:
-            assert state.file is not None
-            await tracker.record(state.name, state.file.checksum, 0, applied_by)
+        try:
+            # One transaction for the whole write step: `chosen` was decided in memory
+            # above, so partway-through failure here must not leave some of those decisions
+            # stamped and others not - that would put `apply` in exactly the position
+            # baseline exists to avoid, half-recognising a schema it should treat as known.
+            async with conn.transaction():
+                for state in chosen:
+                    assert state.file is not None
+                    await tracker.record(state.name, state.file.checksum, 0, applied_by)
+        except Exception as e:
+            out(f"error: failed to write tracking rows: {e}")
+            out("Nothing was written.")
+            return 1
 
         out("")
         out(

@@ -341,6 +341,39 @@ class TestBaseline:
         assert code == 0
         assert len(await Tracker(conn).applied_rows()) == 2
 
+    async def test_write_step_is_all_or_nothing_when_a_write_fails_partway_through(
+        self, conn, migrations_dir, printed, monkeypatch
+    ):
+        """The decide step (the `for state in candidates` prompt loop) already had this
+        guarantee via the `q` path. This proves the separate write step (the `for state in
+        chosen` loop that calls `tracker.record`) has it too: a failure on the second of
+        three writes must not leave the first one committed."""
+
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        write(migrations_dir, "2026-08-05-091530-b.sql", "CREATE TABLE b (id int);")
+        write(migrations_dir, "2026-08-06-091530-c.sql", "CREATE TABLE c (id int);")
+
+        original_record = Tracker.record
+        calls = 0
+
+        async def flaky_record(self, name, checksum, duration_ms, applied_by):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("simulated write failure")
+
+            return await original_record(self, name, checksum, duration_ms, applied_by)
+
+        monkeypatch.setattr(Tracker, "record", flaky_record)
+
+        code = await cmd_baseline(
+            conn, migrations_dir, "migrations", None, False, "test", scripted_prompt(["a"]), out
+        )
+
+        assert code == 1
+        assert await Tracker(conn).applied_rows() == []
+
 
 class TestNew:
     def test_creates_a_timestamped_file(self, migrations_dir, printed):
