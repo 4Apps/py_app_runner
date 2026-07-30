@@ -1,10 +1,17 @@
 import pathlib
 import time
 from collections.abc import Callable
+from datetime import datetime
 
 import psycopg
 
-from py_app_runner.migrations.discovery import MigrationError, discover, find_meta_commands
+from py_app_runner.migrations.discovery import (
+    MigrationError,
+    discover,
+    find_meta_commands,
+    load_migration,
+    new_filename,
+)
 from py_app_runner.migrations.states import MigrationState, State, blocking, compute_states, pending
 from py_app_runner.migrations.tracker import Tracker
 
@@ -168,3 +175,152 @@ async def cmd_apply(
             out(f"Applied {len(queue)} migration(s).")
 
         return 0
+
+
+_NEW_FILE_TEMPLATE = """-- {name}
+--
+-- Runs in a transaction. Add `-- migrations:no-transaction` as the very first line if this
+-- file needs CREATE INDEX CONCURRENTLY or anything else Postgres refuses inside one.
+"""
+
+
+async def cmd_baseline(
+    conn: psycopg.AsyncConnection,
+    directory: pathlib.Path,
+    table: str,
+    to: str | None,
+    assume_yes: bool,
+    applied_by: str,
+    prompt: Callable[[str], str],
+    out: Out,
+) -> int:
+    """Writes tracking rows without executing anything - the adoption path for a database
+    that already has the schema. Nothing is written until every answer is in, so `q` really
+    does leave the table untouched.
+
+    `conn` must be in autocommit mode, for the same reason as `cmd_apply`: `tracker.record()`
+    issues its own INSERT per row with no wrapping transaction and no explicit commit, so on a
+    non-autocommit connection those rows would sit uncommitted - silently discarded if the
+    caller never commits, rather than genuinely "written".
+    """
+
+    if not conn.autocommit:
+        out("error: cmd_baseline requires an autocommit connection")
+        return 1
+
+    tracker = Tracker(conn, table)
+
+    async with tracker.lock():
+        try:
+            _tracker, states = await _load_states(conn, directory, table)
+        except MigrationError as e:
+            out(f"error: {e}")
+            return 1
+
+        candidates = pending(states)
+        if to is not None:
+            # Unlike cmd_apply, this runs without a blocking() guard in front of it, so a
+            # MISSING state (file is None) can still be in `states` here.
+            known = {state.file.prefix for state in states if state.file is not None}
+            if to not in known:
+                out(f"error: no migration with prefix {to!r}")
+                return 1
+
+            candidates = [state for state in candidates if state.file is not None and state.file.prefix <= to]
+
+        if not candidates:
+            out("Nothing to baseline; every migration on disk is already recorded.")
+            return 0
+
+        chosen = []
+        stamp_rest = assume_yes
+        for state in candidates:
+            if stamp_rest:
+                chosen.append(state)
+                continue
+
+            answer = prompt(f"  {state.name:<52} mark as already applied? [y/N/a/q] ").strip().lower()
+            if answer == "q":
+                out("Aborted; nothing was written.")
+                return 1
+
+            if answer == "a":
+                stamp_rest = True
+                chosen.append(state)
+            elif answer == "y":
+                chosen.append(state)
+
+        for state in chosen:
+            assert state.file is not None
+            await tracker.record(state.name, state.file.checksum, 0, applied_by)
+
+        out("")
+        out(
+            f"stamped {len(chosen)} migration(s) as applied (not executed); "
+            f"{len(candidates) - len(chosen)} left pending"
+        )
+
+        return 0
+
+
+def cmd_new(directory: pathlib.Path, name: str, now: datetime, out: Out) -> int:
+    try:
+        filename = new_filename(name, now)
+    except MigrationError as e:
+        out(f"error: {e}")
+        return 1
+
+    if not directory.is_dir():
+        out(f"error: migrations directory does not exist: {directory}")
+        return 1
+
+    path = directory / filename
+    if path.exists():
+        out(f"error: {path} already exists")
+        return 1
+
+    path.write_text(_NEW_FILE_TEMPLATE.format(name=name))
+    out(f"created {path}")
+
+    return 0
+
+
+async def cmd_repair(
+    conn: psycopg.AsyncConnection,
+    directory: pathlib.Path,
+    table: str,
+    name: str,
+    out: Out,
+) -> int:
+    """Re-stamps one migration's checksum after a deliberate edit. The only way out of DRIFT
+    short of reverting the file.
+
+    `conn` must be in autocommit mode, for the same reason as `cmd_baseline`: `update_checksum`
+    is a single UPDATE with no explicit commit of its own.
+    """
+
+    if not conn.autocommit:
+        out("error: cmd_repair requires an autocommit connection")
+        return 1
+
+    path = directory / name
+    if not path.is_file():
+        out(f"error: no such migration file: {path}")
+        return 1
+
+    try:
+        migration = load_migration(path)
+    except MigrationError as e:
+        out(f"error: {e}")
+        return 1
+
+    tracker = Tracker(conn, table)
+    await tracker.ensure_table()
+
+    if not await tracker.update_checksum(migration.name, migration.checksum):
+        out(f"error: {migration.name} has no tracking row - it was never applied, so there is nothing to repair")
+        return 1
+
+    out(f"repaired {migration.name}: checksum re-stamped to {migration.checksum[:12]}...")
+
+    return 0

@@ -1,11 +1,12 @@
+import datetime
 import pathlib
 
 import pytest
 import pytest_asyncio
 
-from py_app_runner.migrations.commands import cmd_apply, cmd_status
+from py_app_runner.migrations.commands import cmd_apply, cmd_baseline, cmd_new, cmd_repair, cmd_status
 from py_app_runner.migrations.tracker import Tracker
-from tests.migrations_pg import pg_dsn_for
+from tests.migrations_pg import dsn, pg_dsn_for
 
 psycopg = pytest.importorskip("psycopg")
 
@@ -229,3 +230,197 @@ class TestApply:
 
         assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
         assert any("026-add-widgets.sql" in line for line in lines)
+
+
+def scripted_prompt(answers: list[str]):
+    """Feeds `baseline` a fixed sequence of answers, and blows up rather than hanging if it
+    asks more questions than the test expects."""
+
+    remaining = list(answers)
+
+    def prompt(_question: str) -> str:
+        if not remaining:
+            raise AssertionError("baseline asked more questions than the test scripted")
+
+        return remaining.pop(0)
+
+    return prompt
+
+
+class TestBaseline:
+    async def test_stamps_the_answers_that_were_yes(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        write(migrations_dir, "2026-08-05-091530-b.sql", "CREATE TABLE b (id int);")
+
+        code = await cmd_baseline(
+            conn, migrations_dir, "migrations", None, False, "test", scripted_prompt(["y", "n"]), out
+        )
+
+        assert code == 0
+        assert [r.name for r in await Tracker(conn).applied_rows()] == ["2026-08-04-091530-a.sql"]
+
+    async def test_never_executes_the_sql(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+
+        await cmd_baseline(
+            conn, migrations_dir, "migrations", None, False, "test", scripted_prompt(["y"]), out
+        )
+
+        assert not await table_exists(conn, "a")
+
+    async def test_records_the_real_checksum_so_apply_sees_no_drift(self, conn, migrations_dir, printed):
+        lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        await cmd_baseline(
+            conn, migrations_dir, "migrations", None, False, "test", scripted_prompt(["y"]), out
+        )
+        lines.clear()
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 0
+        assert any("up to date" in line.lower() for line in lines)
+
+    async def test_answering_a_stamps_everything_remaining(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        write(migrations_dir, "2026-08-05-091530-b.sql", "CREATE TABLE b (id int);")
+        write(migrations_dir, "2026-08-06-091530-c.sql", "CREATE TABLE c (id int);")
+
+        await cmd_baseline(
+            conn, migrations_dir, "migrations", None, False, "test", scripted_prompt(["a"]), out
+        )
+
+        assert len(await Tracker(conn).applied_rows()) == 3
+
+    async def test_answering_q_writes_nothing_at_all(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        write(migrations_dir, "2026-08-05-091530-b.sql", "CREATE TABLE b (id int);")
+
+        code = await cmd_baseline(
+            conn, migrations_dir, "migrations", None, False, "test", scripted_prompt(["y", "q"]), out
+        )
+
+        assert code == 1
+        assert await Tracker(conn).applied_rows() == []
+
+    async def test_empty_answer_defaults_to_no(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+
+        await cmd_baseline(
+            conn, migrations_dir, "migrations", None, False, "test", scripted_prompt([""]), out
+        )
+
+        assert await Tracker(conn).applied_rows() == []
+
+    async def test_to_with_yes_is_non_interactive(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        write(migrations_dir, "2026-08-05-091530-b.sql", "CREATE TABLE b (id int);")
+
+        code = await cmd_baseline(
+            conn, migrations_dir, "migrations", "2026-08-04-091530", True, "test", scripted_prompt([]), out
+        )
+
+        assert code == 0
+        assert [r.name for r in await Tracker(conn).applied_rows()] == ["2026-08-04-091530-a.sql"]
+
+    async def test_already_applied_migrations_are_not_offered(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out)
+        write(migrations_dir, "2026-08-05-091530-b.sql", "CREATE TABLE b (id int);")
+
+        # Only one question is scripted; a second would raise.
+        code = await cmd_baseline(
+            conn, migrations_dir, "migrations", None, False, "test", scripted_prompt(["y"]), out
+        )
+
+        assert code == 0
+        assert len(await Tracker(conn).applied_rows()) == 2
+
+
+class TestNew:
+    def test_creates_a_timestamped_file(self, migrations_dir, printed):
+        lines, out = printed
+        now = datetime.datetime(2026, 8, 4, 9, 15, 30, tzinfo=datetime.UTC)
+
+        assert cmd_new(migrations_dir, "add widgets table", now, out) == 0
+
+        created = migrations_dir / "2026-08-04-091530-add-widgets-table.sql"
+        assert created.exists()
+        assert "add widgets table" in created.read_text()
+        assert any(created.name in line for line in lines)
+
+    def test_refuses_to_overwrite_an_existing_file(self, migrations_dir, printed):
+        _lines, out = printed
+        now = datetime.datetime(2026, 8, 4, 9, 15, 30, tzinfo=datetime.UTC)
+        cmd_new(migrations_dir, "add widgets table", now, out)
+
+        assert cmd_new(migrations_dir, "add widgets table", now, out) == 1
+
+
+class TestRepair:
+    async def test_restamps_a_drifted_migration(self, conn, migrations_dir, printed):
+        lines, out = printed
+        path = write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out)
+        path.write_text("CREATE TABLE a (id int); -- deliberate edit")
+
+        assert await cmd_repair(conn, migrations_dir, "migrations", "2026-08-04-091530-a.sql", out) == 0
+
+        lines.clear()
+        assert await cmd_status(conn, migrations_dir, "migrations", check=True, out=out) == 0
+
+    async def test_unknown_name_is_an_error(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+
+        assert await cmd_repair(conn, migrations_dir, "migrations", "2026-08-04-091530-a.sql", out) == 1
+
+
+class TestAutocommitGuard:
+    """`cmd_apply`'s guard (added in Task 5) had no coverage; `cmd_baseline` and `cmd_repair`
+    grow the same guard in this task, for the same reason: none of the three commit anything
+    themselves, so a non-autocommit connection would leave their writes uncommitted rather than
+    genuinely applied."""
+
+    async def test_apply_refuses_a_non_autocommit_connection(self, conn, migrations_dir, printed):
+        lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+
+        other_dsn = dsn(conn.info.dbname)
+        async with await psycopg.AsyncConnection.connect(other_dsn, autocommit=False) as other:
+            code = await cmd_apply(other, migrations_dir, "migrations", False, None, "test", out)
+
+        assert code == 1
+        assert any("autocommit" in line.lower() for line in lines)
+        assert not await table_exists(conn, "a")
+
+    async def test_baseline_refuses_a_non_autocommit_connection(self, conn, migrations_dir, printed):
+        lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+
+        other_dsn = dsn(conn.info.dbname)
+        async with await psycopg.AsyncConnection.connect(other_dsn, autocommit=False) as other:
+            code = await cmd_baseline(
+                other, migrations_dir, "migrations", None, False, "test", scripted_prompt([]), out
+            )
+
+        assert code == 1
+        assert any("autocommit" in line.lower() for line in lines)
+
+    async def test_repair_refuses_a_non_autocommit_connection(self, conn, migrations_dir, printed):
+        lines, out = printed
+        path = write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out)
+        path.write_text("CREATE TABLE a (id int); -- deliberate edit")
+
+        other_dsn = dsn(conn.info.dbname)
+        async with await psycopg.AsyncConnection.connect(other_dsn, autocommit=False) as other:
+            code = await cmd_repair(other, migrations_dir, "migrations", "2026-08-04-091530-a.sql", out)
+
+        assert code == 1
+        assert any("autocommit" in line.lower() for line in lines)
