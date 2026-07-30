@@ -10,12 +10,6 @@ from py_app_runner.migrations.tracker import Tracker
 
 Out = Callable[[str], None]
 
-# Length of the `YYYY-MM-DD-HHMMSS` prefix that discovery.MIGRATION_FILENAME_RE matches as
-# its first group. Sliced off `state.name` rather than read from `MigrationFile.prefix`,
-# because MISSING states have `file is None` - the name string is the only thing every
-# state is guaranteed to have.
-PREFIX_LENGTH = 17
-
 
 async def _load_states(
     conn: psycopg.AsyncConnection, directory: pathlib.Path, table: str
@@ -82,6 +76,20 @@ async def cmd_apply(
     applied_by: str,
     out: Out,
 ) -> int:
+    """Apply pending migrations to `conn`.
+
+    `conn` must be in autocommit mode. `tracker.lock()`'s advisory-lock statement would
+    otherwise implicitly open a transaction, so each migration's `conn.transaction()`
+    degrades to a SAVEPOINT instead of a real BEGIN/COMMIT - a mid-run failure would then
+    roll the whole outer transaction back on unlock, undoing migrations this function
+    already reported as applied. `CREATE INDEX CONCURRENTLY` in the no-transaction branch
+    also requires autocommit outright.
+    """
+
+    if not conn.autocommit:
+        out("error: cmd_apply requires an autocommit connection")
+        return 1
+
     tracker = Tracker(conn, table)
 
     async with tracker.lock():
@@ -97,12 +105,15 @@ async def cmd_apply(
 
         queue = pending(states)
         if to is not None:
-            known = {state.name[:PREFIX_LENGTH] for state in states}
+            # blocking(states) was empty, so no MISSING state remains here and every
+            # state has a file - the `is not None` filter is structural narrowing for
+            # pyrefly, not a real behavioural filter.
+            known = {state.file.prefix for state in states if state.file is not None}
             if to not in known:
                 out(f"error: no migration with prefix {to!r}")
                 return 1
 
-            queue = [state for state in queue if state.name[:PREFIX_LENGTH] <= to]
+            queue = [state for state in queue if state.file is not None and state.file.prefix <= to]
 
         if not queue:
             out("Database is up to date; nothing to apply.")
@@ -130,7 +141,7 @@ async def cmd_apply(
             try:
                 if state.file.no_transaction:
                     async with conn.cursor() as cur:
-                        await cur.execute(state.file.sql.encode())
+                        await cur.execute(state.file.sql.encode(conn.info.encoding))
 
                     duration_ms = int((time.monotonic() - started) * 1000)
                     await tracker.record(state.name, state.file.checksum, duration_ms, applied_by)
@@ -139,7 +150,7 @@ async def cmd_apply(
                     # migration, so a file either fully lands and is recorded, or neither.
                     async with conn.transaction():
                         async with conn.cursor() as cur:
-                            await cur.execute(state.file.sql.encode())
+                            await cur.execute(state.file.sql.encode(conn.info.encoding))
 
                         duration_ms = int((time.monotonic() - started) * 1000)
                         await tracker.record(state.name, state.file.checksum, duration_ms, applied_by)
