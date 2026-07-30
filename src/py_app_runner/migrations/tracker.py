@@ -1,8 +1,9 @@
+import contextlib
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 import psycopg
 from psycopg import sql
+from psycopg.pq import TransactionStatus
 
 from py_app_runner.migrations.states import AppliedRow
 
@@ -66,16 +67,32 @@ class Tracker:
             await cur.execute(statement, (checksum, name))
             return cur.rowcount == 1
 
-    @asynccontextmanager
+    @contextlib.asynccontextmanager
     async def lock(self) -> AsyncIterator[None]:
         """Session-level advisory lock held for the whole run. A crashed process drops its
-        connection, and Postgres releases the lock with it."""
+        connection, and Postgres releases the lock with it.
+
+        The lock will wrap real migration execution, so a failing body may leave a
+        non-autocommit connection in an aborted transaction. Releasing the lock then needs a
+        rollback first, and its own failure must never replace the body's real exception as
+        what the caller sees.
+        """
 
         async with self.conn.cursor() as cur:
             await cur.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
 
         try:
             yield
-        finally:
-            async with self.conn.cursor() as cur:
-                await cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self._unlock()
+            raise
+        else:
+            await self._unlock()
+
+    async def _unlock(self) -> None:
+        if self.conn.info.transaction_status == TransactionStatus.INERROR:
+            await self.conn.rollback()
+
+        async with self.conn.cursor() as cur:
+            await cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))

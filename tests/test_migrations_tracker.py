@@ -121,3 +121,26 @@ class TestLock:
             # another connection's unrelated lock cannot make this assertion pass by accident.
             await cur.execute("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()")
             assert (await cur.fetchone())[0] == 0
+
+    async def test_original_error_survives_a_failed_transaction_on_release(self, conn):
+        """On a non-autocommit connection, a real SQL error inside the lock body leaves the
+        session in an aborted transaction. Releasing the lock must roll that back before
+        unlocking, so the caller sees the original SQL error rather than an
+        InFailedSqlTransaction raised by the unlock itself."""
+
+        await Tracker(conn).ensure_table()
+
+        other_dsn = dsn(conn.info.dbname)
+        async with await psycopg.AsyncConnection.connect(other_dsn, autocommit=False) as other:
+            tracker = Tracker(other)
+
+            with pytest.raises(psycopg.errors.UndefinedTable):
+                async with tracker.lock():
+                    async with other.cursor() as cur:
+                        await cur.execute("SELECT * FROM this_table_does_not_exist")
+
+            async with other.cursor() as cur:
+                await cur.execute(
+                    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+                )
+                assert (await cur.fetchone())[0] == 0
