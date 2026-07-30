@@ -36,7 +36,11 @@ def load_migration(path: pathlib.Path) -> MigrationFile:
         raise MigrationError(f"Bad migration filename {path.name!r}: expected YYYY-MM-DD-HHMMSS-kebab-name.sql")
 
     raw = path.read_bytes()
-    sql = raw.decode("utf-8")
+    try:
+        sql = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MigrationError(f"Migration {path.name!r} is not valid UTF-8: {exc}") from exc
+
     first_line = sql.split("\n", 1)[0].strip()
 
     return MigrationFile(

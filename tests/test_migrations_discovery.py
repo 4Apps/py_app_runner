@@ -30,6 +30,15 @@ class TestChecksum:
         assert one.checksum != two.checksum
 
 
+class TestLoadMigration:
+    def test_rejects_a_file_that_is_not_valid_utf8(self, tmp_path):
+        path = tmp_path / "2026-08-04-091530-a.sql"
+        path.write_bytes(b"SELECT 1; -- \xff\xfe bad byte\n")
+
+        with pytest.raises(MigrationError, match="2026-08-04-091530-a.sql"):
+            load_migration(path)
+
+
 class TestDiscover:
     def test_orders_chronologically_by_filename(self, tmp_path):
         write(tmp_path, "2026-08-04-164512-b.sql")
