@@ -63,6 +63,17 @@ class TestRegSubparsers:
         args = parser.parse_args(["--dry-run", "migrations", "status"])
         assert args.dry_run is True
 
+        # The dangerous case: --dry-run given BEFORE the subcommand, with `apply` not
+        # repeating it. Without `default=SUPPRESS` on the subparser's own --dry-run,
+        # _SubParsersAction copies apply's unset default (False) back onto the parent
+        # namespace and silently turns this into a real, non-dry-run apply.
+        args = parser.parse_args(["--dry-run", "migrations", "apply"])
+        assert args.dry_run is True
+
+        # Both given: still true.
+        args = parser.parse_args(["--dry-run", "migrations", "apply", "--dry-run"])
+        assert args.dry_run is True
+
     def test_apply_to_flag(self):
         parser = build_parser()
         args = parser.parse_args(["migrations", "apply", "--to", "2026-08-04-091530"])

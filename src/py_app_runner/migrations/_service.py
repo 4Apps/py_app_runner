@@ -64,7 +64,8 @@ async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Log
         if args.step == "status":
             code = await cmd_status(conn, directory, table, args.check, out)
         elif args.step == "apply":
-            code = await cmd_apply(conn, directory, table, args.dry_run, args.to, applied_by, out)
+            dry_run = getattr(args, "dry_run", False)
+            code = await cmd_apply(conn, directory, table, dry_run, args.to, applied_by, out)
         elif args.step == "baseline":
             code = await cmd_baseline(conn, directory, table, args.to, args.yes, applied_by, input, out)
         elif args.step == "repair":

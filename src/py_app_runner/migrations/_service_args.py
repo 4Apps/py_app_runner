@@ -8,7 +8,7 @@
 """
 
 import logging
-from argparse import ArgumentParser, _SubParsersAction  # type: ignore
+from argparse import SUPPRESS, ArgumentParser, _SubParsersAction  # type: ignore
 
 from py_app_runner.pybridge import PyBridge
 
@@ -17,7 +17,7 @@ def reg_subparsers(
     subparsers: "_SubParsersAction[ArgumentParser]",
     _pybridge: PyBridge,
     _base_logger: logging.Logger,
-):
+) -> None:
     """Command line subparsers"""
 
     parser = subparsers.add_parser(
@@ -35,7 +35,12 @@ def reg_subparsers(
     )
 
     apply_parser = group.add_parser("apply", help="Apply every pending migration, in order")
-    apply_parser.add_argument("--dry-run", action="store_true", help="List what would run; change nothing")
+    apply_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=SUPPRESS,
+        help="List what would run; change nothing",
+    )
     apply_parser.add_argument(
         "--to",
         type=str,
