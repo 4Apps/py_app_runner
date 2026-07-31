@@ -457,3 +457,64 @@ class TestAutocommitGuard:
 
         assert code == 1
         assert any("autocommit" in line.lower() for line in lines)
+
+
+class TestServiceConfig:
+    def test_connect_kwargs_maps_pgsqlconfig_names(self):
+        from py_app_runner.migrations._service import connect_kwargs
+
+        assert connect_kwargs(
+            {
+                "hostname": "db.example.com",
+                "port": 5433,
+                "username": "app",
+                "password": "secret",
+                "database": "appdb",
+                "ssl": "require",
+            }
+        ) == {
+            "host": "db.example.com",
+            "port": 5433,
+            "user": "app",
+            "password": "secret",
+            "dbname": "appdb",
+            "sslmode": "require",
+            "autocommit": True,
+        }
+
+    def test_connect_kwargs_applies_defaults(self):
+        from py_app_runner.migrations._service import connect_kwargs
+
+        result = connect_kwargs(
+            {"hostname": "db", "username": "app", "password": "s", "database": "appdb"}
+        )
+
+        assert result["port"] == 5432
+        assert result["sslmode"] == "prefer"
+
+    def test_settings_default_when_config_has_no_migrations_key(self, tmp_path):
+        from py_app_runner.migrations._service import migrations_settings
+
+        directory, table = migrations_settings({"current_path": str(tmp_path)})
+
+        assert directory == tmp_path / "data" / "migrations"
+        assert table == "migrations"
+
+    def test_settings_honour_explicit_values(self, tmp_path):
+        from py_app_runner.migrations._service import migrations_settings
+
+        directory, table = migrations_settings(
+            {"current_path": str(tmp_path), "migrations": {"dir": "sql/steps", "table": "schema_history"}}
+        )
+
+        assert directory == tmp_path / "sql" / "steps"
+        assert table == "schema_history"
+
+    def test_settings_accept_an_absolute_dir(self, tmp_path):
+        from py_app_runner.migrations._service import migrations_settings
+
+        directory, _table = migrations_settings(
+            {"current_path": "/somewhere/else", "migrations": {"dir": str(tmp_path)}}
+        )
+
+        assert directory == tmp_path
