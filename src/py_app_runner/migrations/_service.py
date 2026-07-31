@@ -9,6 +9,7 @@ from typing import Any
 import psycopg
 
 from py_app_runner.migrations.commands import (
+    Out,
     cmd_apply,
     cmd_baseline,
     cmd_new,
@@ -118,17 +119,66 @@ def resolve_targets(config: dict[str, Any]) -> dict[str, Target]:
     return {_DEFAULT_TARGET_NAME: target}
 
 
+# status and apply run every configured target unless narrowed with --target: status is a
+# read-only report, and apply's own per-target failure handling (see below) is what keeps a
+# fan-out safe. new/baseline/repair are single-item: baseline in particular writes tracking
+# rows without ever running the SQL, so a mis-stamped baseline against the wrong target
+# produces a permanently green `status` over a database that never got its tables - the
+# worst failure this tool can produce, silently. Guessing which target that should be is not
+# acceptable, so those three refuse outright when more than one target is configured and
+# --target was not given.
+_FAN_OUT_STEPS = frozenset({"status", "apply"})
+
+
+def _out_for(name: str, multi: bool) -> Out:
+    """Single-target output must stay byte-identical to today, so `print` is used directly
+    below whenever only one target is in play. In the multi-target case, each line is
+    prefixed with its target's name - except blank lines, which commands use as visual
+    separators; a `[name] ` prefix on those would just be noise."""
+
+    if not multi:
+        return print
+
+    def prefixed(line: str) -> None:
+        print(f"[{name}] {line}" if line else "")
+
+    return prefixed
+
+
+def _select_targets(step: str, requested: str | None, targets: dict[str, Target]) -> list[Target]:
+    if requested is not None:
+        if requested not in targets:
+            print(
+                f"error: no migrations target {requested!r}; configured targets are: "
+                f"{', '.join(targets) or 'none'}."
+            )
+            raise SystemExit(1)
+
+        return [targets[requested]]
+
+    if step in _FAN_OUT_STEPS or len(targets) == 1:
+        return list(targets.values())
+
+    print(
+        f"error: migrations {step!r} needs --target since more than one target is configured; "
+        f"configured targets are: {', '.join(targets)}."
+    )
+    raise SystemExit(1)
+
+
 async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Logger) -> None:
     config = AppRegistry.config()
-    target = next(iter(resolve_targets(config).values()))
-    directory, table = target.directory, target.table
-    out = print
+    targets = resolve_targets(config)
+    selected = _select_targets(args.step, getattr(args, "target", None), targets)
+    multi = len(selected) > 1
 
     if args.step == "new":
-        raise SystemExit(cmd_new(directory, args.name, datetime.now(UTC), out))
+        # Synchronous and needs no database - dispatched before any connection is opened.
+        # _select_targets already refused ambiguity above, so exactly one target here.
+        target = selected[0]
+        raise SystemExit(cmd_new(target.directory, args.name, datetime.now(UTC), _out_for(target.name, multi)))
 
     applied_by = f"{config.get('app_version', 'unknown')} @ {socket.gethostname()}"
-    logger.debug(f"migrations: dir={directory} table={table}")
 
     # runner.py catches Exception around init_service, logs it and returns normally - which
     # exits 0. For a long-running service that is deliberate, but here it would tell an
@@ -137,21 +187,45 @@ async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Log
     # success is the one outcome this tool must never produce, so every non-SystemExit failure
     # is converted into a non-zero exit here, inside the service, without touching runner.py.
     # SystemExit derives from BaseException, so the happy-path exit below is not re-wrapped.
-    code = 1
+    code = 0
     try:
-        async with await psycopg.AsyncConnection.connect(**connect_kwargs(config["db"][target.db])) as conn:
-            if args.step == "status":
-                code = await cmd_status(conn, directory, table, args.check, out)
-            elif args.step == "apply":
-                dry_run = getattr(args, "dry_run", False)
-                code = await cmd_apply(conn, directory, table, dry_run, args.to, applied_by, out)
-            elif args.step == "baseline":
-                code = await cmd_baseline(conn, directory, table, args.to, args.yes, applied_by, input, out)
-            elif args.step == "repair":
-                code = await cmd_repair(conn, directory, table, args.name, out)
+        # One connection per target, processed strictly in sequence: two targets can point at
+        # the same physical database (e.g. a dev box collapsing "main" and "gis"), and the
+        # advisory lock tracker.lock() takes would contend with itself under concurrency.
+        for target in selected:
+            logger.debug(f"migrations: target={target.name} dir={target.directory} table={target.table}")
+            out = _out_for(target.name, multi)
+
+            async with await psycopg.AsyncConnection.connect(**connect_kwargs(config["db"][target.db])) as conn:
+                if args.step == "status":
+                    target_code = await cmd_status(conn, target.directory, target.table, args.check, out)
+                elif args.step == "apply":
+                    dry_run = getattr(args, "dry_run", False)
+                    target_code = await cmd_apply(
+                        conn, target.directory, target.table, dry_run, args.to, applied_by, out
+                    )
+                elif args.step == "baseline":
+                    target_code = await cmd_baseline(
+                        conn, target.directory, target.table, args.to, args.yes, applied_by, input, out
+                    )
+                elif args.step == "repair":
+                    target_code = await cmd_repair(conn, target.directory, target.table, args.name, out)
+                else:
+                    out(f"error: unknown migrations command {args.step!r}")
+                    target_code = 1
+
+            if args.step == "apply":
+                # Stop at the first failing target: a broken `main` must never leave a
+                # deploy half-migrated across two databases by ploughing on to the next one.
+                code = target_code
+                if code != 0:
+                    break
+            elif args.step == "status":
+                # Every target is checked regardless of earlier results: `--check` must
+                # report on all of them, not just the first failure.
+                code = code or target_code
             else:
-                out(f"error: unknown migrations command {args.step!r}")
-                code = 1
+                code = target_code
 
     except Exception:
         logger.exception("migrations: unhandled failure")

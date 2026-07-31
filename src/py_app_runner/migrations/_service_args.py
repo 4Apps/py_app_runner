@@ -1,16 +1,31 @@
 """CLI subparsers for the built-in migrations service.
 
-    python3 src/app.py migrations status   [--check]
-    python3 src/app.py migrations apply    [--dry-run] [--to PREFIX]
-    python3 src/app.py migrations baseline [--to PREFIX] [--yes]
-    python3 src/app.py migrations new      <name>
-    python3 src/app.py migrations repair   <filename>
+    python3 src/app.py migrations status   [--check] [--target NAME]
+    python3 src/app.py migrations apply    [--dry-run] [--to PREFIX] [--target NAME]
+    python3 src/app.py migrations baseline [--to PREFIX] [--yes] [--target NAME]
+    python3 src/app.py migrations new      <name> [--target NAME]
+    python3 src/app.py migrations repair   <filename> [--target NAME]
+
+`--target` has no top-level counterpart on `runner.py`'s parser (unlike `apply`'s
+`--dry-run`, which shadows a real top-level flag and needs `default=SUPPRESS` to avoid
+clobbering it - see the collision test in tests/test_migrations_service.py). A plain
+`default=None` is enough here, and `None` is what lets `init_service` tell "no --target
+given" apart from "given as main".
 """
 
 import logging
 from argparse import SUPPRESS, ArgumentParser, _SubParsersAction  # type: ignore
 
 from py_app_runner.pybridge import PyBridge
+
+
+def _add_target(parser: ArgumentParser) -> None:
+    parser.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help='Named migrations target to operate on (see config["migrations"]["targets"])',
+    )
 
 
 def reg_subparsers(
@@ -33,6 +48,7 @@ def reg_subparsers(
         action="store_true",
         help="Exit 1 if anything is pending or drifted (for deploy assertions)",
     )
+    _add_target(status_parser)
 
     apply_parser = group.add_parser("apply", help="Apply every pending migration, in order")
     apply_parser.add_argument(
@@ -47,6 +63,7 @@ def reg_subparsers(
         default=None,
         help="Stop after the migration with this YYYY-MM-DD-HHMMSS prefix",
     )
+    _add_target(apply_parser)
 
     baseline_parser = group.add_parser(
         "baseline",
@@ -63,9 +80,12 @@ def reg_subparsers(
         action="store_true",
         help="Do not ask; stamp every offered migration (for scripts)",
     )
+    _add_target(baseline_parser)
 
     new_parser = group.add_parser("new", help="Create an empty, timestamped migration file")
     new_parser.add_argument("name", type=str, help="Short description, e.g. 'add widgets table'")
+    _add_target(new_parser)
 
     repair_parser = group.add_parser("repair", help="Re-stamp one migration's checksum after a deliberate edit")
     repair_parser.add_argument("name", type=str, help="Migration filename, e.g. 2026-08-04-091530-a.sql")
+    _add_target(repair_parser)

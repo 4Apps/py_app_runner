@@ -18,7 +18,7 @@ import pytest
 from py_app_runner.migrations._service import init_service
 from py_app_runner.migrations._service_args import reg_subparsers
 from py_app_runner.registry import AppRegistry
-from tests.migrations_pg import PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, pg_dsn_for
+from tests.migrations_pg import PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, dsn, pg_dsn_for
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,6 +97,34 @@ class TestRegSubparsers:
         parser = build_parser()
         args = parser.parse_args(["migrations", "repair", "2026-08-04-091530-a.sql"])
         assert args.name == "2026-08-04-091530-a.sql"
+
+    def test_target_defaults_to_none_on_all_five_subcommands(self):
+        parser = build_parser()
+
+        for argv in (
+            ["migrations", "status"],
+            ["migrations", "apply"],
+            ["migrations", "baseline"],
+            ["migrations", "new", "widgets"],
+            ["migrations", "repair", "2026-08-04-091530-a.sql"],
+        ):
+            # Default absent (None), not a hardcoded "main" - dispatch needs to tell "no
+            # --target given" apart from "given as main".
+            assert parser.parse_args(argv).target is None
+
+    def test_target_parses_on_all_five_subcommands(self):
+        parser = build_parser()
+
+        for argv, expected_step in (
+            (["migrations", "status", "--target", "gis"], "status"),
+            (["migrations", "apply", "--target", "gis"], "apply"),
+            (["migrations", "baseline", "--target", "gis"], "baseline"),
+            (["migrations", "new", "widgets", "--target", "gis"], "new"),
+            (["migrations", "repair", "2026-08-04-091530-a.sql", "--target", "gis"], "repair"),
+        ):
+            args = parser.parse_args(argv)
+            assert args.step == expected_step
+            assert args.target == "gis"
 
 
 @pytest.fixture
@@ -339,3 +367,350 @@ class TestProcessExitCodes:
 
             result = run_app(working, "migrations", "apply")
             assert result.returncode == 0, result.stderr
+
+
+def _two_target_config(tmp_path: pathlib.Path, db_alpha: str, db_beta: str) -> dict:
+    (tmp_path / "data" / "migrations_alpha").mkdir(parents=True)
+    (tmp_path / "data" / "migrations_beta").mkdir(parents=True)
+
+    return {
+        "current_path": str(tmp_path),
+        "app_version": "test-version",
+        "db": {
+            "alpha": {
+                "hostname": PG_HOST,
+                "port": PG_PORT,
+                "username": PG_USER,
+                "password": PG_PASSWORD,
+                "database": db_alpha,
+            },
+            "beta": {
+                "hostname": PG_HOST,
+                "port": PG_PORT,
+                "username": PG_USER,
+                "password": PG_PASSWORD,
+                "database": db_beta,
+            },
+        },
+        "migrations": {
+            "targets": {
+                "alpha": {"dir": "data/migrations_alpha"},
+                "beta": {"dir": "data/migrations_beta"},
+            }
+        },
+    }
+
+
+class TestMultiTargetDispatch:
+    """Two named targets (declaration order: alpha, then beta), each against its own
+    throwaway database - proving fan-out, --target narrowing, and the single-item refusal
+    all dispatch the way the plan requires."""
+
+    async def test_single_target_output_has_no_prefix(self, tmp_path, saved_registry, capsys):
+        """Backward compatibility: with exactly one target configured, output must stay
+        byte-identical to before this task - no `[main] ` noise."""
+
+        migrations_dir = tmp_path / "data" / "migrations"
+        migrations_dir.mkdir(parents=True)
+        (migrations_dir / "2026-08-04-091530-x.sql").write_text("CREATE TABLE x_marker (id int);")
+
+        db_name = "par_test_single_target_prefix"
+        async with pg_dsn_for(db_name):
+            config = {
+                "current_path": str(tmp_path),
+                "app_version": "test-version",
+                "db": {
+                    "main": {
+                        "hostname": PG_HOST,
+                        "port": PG_PORT,
+                        "username": PG_USER,
+                        "password": PG_PASSWORD,
+                        "database": db_name,
+                    }
+                },
+            }
+            AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="apply", dry_run=False, to=None, target=None), None, logging.getLogger("test")
+                )
+            assert excinfo.value.code == 0
+
+            out = capsys.readouterr().out
+            assert "[main]" not in out
+            assert "applied 2026-08-04-091530-x.sql" in out
+
+    async def test_apply_with_no_target_hits_both_targets_in_declared_order(
+        self, tmp_path, saved_registry, capsys
+    ):
+        db_alpha, db_beta = "par_test_multi_apply_alpha", "par_test_multi_apply_beta"
+        async with pg_dsn_for(db_alpha), pg_dsn_for(db_beta):
+            config = _two_target_config(tmp_path, db_alpha, db_beta)
+            (tmp_path / "data" / "migrations_alpha" / "2026-08-04-091530-a.sql").write_text(
+                "CREATE TABLE alpha_marker (id int);"
+            )
+            (tmp_path / "data" / "migrations_beta" / "2026-08-04-091530-b.sql").write_text(
+                "CREATE TABLE beta_marker (id int);"
+            )
+            AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="apply", dry_run=False, to=None, target=None), None, logging.getLogger("test")
+                )
+            assert excinfo.value.code == 0
+
+            out = capsys.readouterr().out
+            assert out.index("[alpha]") < out.index("[beta]")
+
+            for db_name, table in ((db_alpha, "alpha_marker"), (db_beta, "beta_marker")):
+                async with await psycopg.AsyncConnection.connect(dsn(db_name), autocommit=True) as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT to_regclass(%s)", (table,))
+                        assert (await cur.fetchone())[0] == table
+
+    async def test_status_with_no_target_reports_both_targets_in_declared_order(
+        self, tmp_path, saved_registry, capsys
+    ):
+        db_alpha, db_beta = "par_test_multi_status_alpha", "par_test_multi_status_beta"
+        async with pg_dsn_for(db_alpha), pg_dsn_for(db_beta):
+            config = _two_target_config(tmp_path, db_alpha, db_beta)
+            (tmp_path / "data" / "migrations_alpha" / "2026-08-04-091530-a.sql").write_text(
+                "CREATE TABLE alpha_marker (id int);"
+            )
+            (tmp_path / "data" / "migrations_beta" / "2026-08-04-091530-b.sql").write_text(
+                "CREATE TABLE beta_marker (id int);"
+            )
+            AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+            with pytest.raises(SystemExit):
+                await init_service(
+                    Namespace(step="status", check=False, target=None), None, logging.getLogger("test")
+                )
+
+            out = capsys.readouterr().out
+            lines = out.splitlines()
+            assert out.index("[alpha]") < out.index("[beta]")
+            # Blank separator lines are preserved as genuinely blank, not turned into
+            # `[name] ` noise.
+            assert "" in lines
+            assert "[alpha] " not in lines
+            assert "[beta] " not in lines
+
+    async def test_target_flag_only_touches_the_named_target(self, tmp_path, saved_registry):
+        db_alpha, db_beta = "par_test_target_only_alpha", "par_test_target_only_beta"
+        async with pg_dsn_for(db_alpha), pg_dsn_for(db_beta):
+            config = _two_target_config(tmp_path, db_alpha, db_beta)
+            (tmp_path / "data" / "migrations_alpha" / "2026-08-04-091530-a.sql").write_text(
+                "CREATE TABLE alpha_marker (id int);"
+            )
+            (tmp_path / "data" / "migrations_beta" / "2026-08-04-091530-b.sql").write_text(
+                "CREATE TABLE beta_marker (id int);"
+            )
+            AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="apply", dry_run=False, to=None, target="alpha"),
+                    None,
+                    logging.getLogger("test"),
+                )
+            assert excinfo.value.code == 0
+
+            async with await psycopg.AsyncConnection.connect(dsn(db_alpha), autocommit=True) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT to_regclass('alpha_marker')")
+                    assert (await cur.fetchone())[0] == "alpha_marker"
+
+            # beta was never touched: no tracking table, no marker table.
+            async with await psycopg.AsyncConnection.connect(dsn(db_beta), autocommit=True) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT to_regclass('beta_marker')")
+                    assert (await cur.fetchone())[0] is None
+                    await cur.execute("SELECT to_regclass('migrations')")
+                    assert (await cur.fetchone())[0] is None
+
+    async def test_unknown_target_exits_one_and_names_configured_targets(self, tmp_path, saved_registry, capsys):
+        db_alpha, db_beta = "par_test_unknown_target_alpha", "par_test_unknown_target_beta"
+        async with pg_dsn_for(db_alpha), pg_dsn_for(db_beta):
+            config = _two_target_config(tmp_path, db_alpha, db_beta)
+            AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="status", check=False, target="nope"), None, logging.getLogger("test")
+                )
+            assert excinfo.value.code == 1
+
+            out = capsys.readouterr().out
+            assert "nope" in out
+            assert "alpha" in out
+            assert "beta" in out
+
+    async def test_apply_stops_at_first_failing_target_and_skips_the_rest(self, tmp_path, saved_registry):
+        db_alpha, db_beta = "par_test_apply_stop_alpha", "par_test_apply_stop_beta"
+        async with pg_dsn_for(db_alpha), pg_dsn_for(db_beta):
+            config = _two_target_config(tmp_path, db_alpha, db_beta)
+            # alpha (first in declaration order) fails; beta must never be attempted.
+            (tmp_path / "data" / "migrations_alpha" / "2026-08-04-091530-broken.sql").write_text("THIS IS NOT SQL;")
+            (tmp_path / "data" / "migrations_beta" / "2026-08-04-091530-b.sql").write_text(
+                "CREATE TABLE beta_marker (id int);"
+            )
+            AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="apply", dry_run=False, to=None, target=None), None, logging.getLogger("test")
+                )
+            assert excinfo.value.code == 1
+
+            async with await psycopg.AsyncConnection.connect(dsn(db_beta), autocommit=True) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT to_regclass('beta_marker')")
+                    assert (await cur.fetchone())[0] is None
+
+    async def test_status_check_exits_one_if_any_target_has_pending_work(self, tmp_path, saved_registry):
+        db_alpha, db_beta = "par_test_status_check_alpha", "par_test_status_check_beta"
+        async with pg_dsn_for(db_alpha), pg_dsn_for(db_beta):
+            config = _two_target_config(tmp_path, db_alpha, db_beta)
+            (tmp_path / "data" / "migrations_alpha" / "2026-08-04-091530-a.sql").write_text(
+                "CREATE TABLE alpha_marker (id int);"
+            )
+            (tmp_path / "data" / "migrations_beta" / "2026-08-04-091530-b.sql").write_text(
+                "CREATE TABLE beta_marker (id int);"
+            )
+            AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="status", check=True, target=None), None, logging.getLogger("test")
+                )
+            assert excinfo.value.code == 1  # both pending
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="apply", dry_run=False, to=None, target="alpha"),
+                    None,
+                    logging.getLogger("test"),
+                )
+            assert excinfo.value.code == 0
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="status", check=True, target=None), None, logging.getLogger("test")
+                )
+            assert excinfo.value.code == 1  # beta still pending
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="apply", dry_run=False, to=None, target="beta"),
+                    None,
+                    logging.getLogger("test"),
+                )
+            assert excinfo.value.code == 0
+
+            with pytest.raises(SystemExit) as excinfo:
+                await init_service(
+                    Namespace(step="status", check=True, target=None), None, logging.getLogger("test")
+                )
+            assert excinfo.value.code == 0  # both clean now
+
+    async def test_new_refuses_without_target_when_multiple_are_configured(self, tmp_path, saved_registry, capsys):
+        # Deliberately unreachable: a refusal must happen before any connection attempt.
+        config = {
+            "current_path": str(tmp_path),
+            "db": {
+                "alpha": {
+                    "hostname": "no-such-host-at-all.invalid",
+                    "username": "x",
+                    "password": "x",
+                    "database": "x",
+                },
+                "beta": {
+                    "hostname": "no-such-host-at-all.invalid",
+                    "username": "x",
+                    "password": "x",
+                    "database": "x",
+                },
+            },
+            "migrations": {"targets": {"alpha": {}, "beta": {}}},
+        }
+        AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+        with pytest.raises(SystemExit) as excinfo:
+            await init_service(
+                Namespace(step="new", name="add widgets", target=None), None, logging.getLogger("test")
+            )
+        assert excinfo.value.code == 1
+
+        out = capsys.readouterr().out
+        assert "needs --target" in out
+        assert "alpha" in out
+        assert "beta" in out
+
+    async def test_baseline_refuses_without_target_when_multiple_are_configured(self, tmp_path, saved_registry, capsys):
+        config = {
+            "current_path": str(tmp_path),
+            "db": {
+                "alpha": {
+                    "hostname": "no-such-host-at-all.invalid",
+                    "username": "x",
+                    "password": "x",
+                    "database": "x",
+                },
+                "beta": {
+                    "hostname": "no-such-host-at-all.invalid",
+                    "username": "x",
+                    "password": "x",
+                    "database": "x",
+                },
+            },
+            "migrations": {"targets": {"alpha": {}, "beta": {}}},
+        }
+        AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+        with pytest.raises(SystemExit) as excinfo:
+            await init_service(
+                Namespace(step="baseline", to=None, yes=True, target=None), None, logging.getLogger("test")
+            )
+        assert excinfo.value.code == 1
+
+        out = capsys.readouterr().out
+        assert "needs --target" in out
+        assert "alpha" in out
+        assert "beta" in out
+
+    async def test_repair_refuses_without_target_when_multiple_are_configured(self, tmp_path, saved_registry, capsys):
+        config = {
+            "current_path": str(tmp_path),
+            "db": {
+                "alpha": {
+                    "hostname": "no-such-host-at-all.invalid",
+                    "username": "x",
+                    "password": "x",
+                    "database": "x",
+                },
+                "beta": {
+                    "hostname": "no-such-host-at-all.invalid",
+                    "username": "x",
+                    "password": "x",
+                    "database": "x",
+                },
+            },
+            "migrations": {"targets": {"alpha": {}, "beta": {}}},
+        }
+        AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+        with pytest.raises(SystemExit) as excinfo:
+            await init_service(
+                Namespace(step="repair", name="2026-08-04-091530-a.sql", target=None),
+                None,
+                logging.getLogger("test"),
+            )
+        assert excinfo.value.code == 1
+
+        out = capsys.readouterr().out
+        assert "needs --target" in out
+        assert "alpha" in out
+        assert "beta" in out
