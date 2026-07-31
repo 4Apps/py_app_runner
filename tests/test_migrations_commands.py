@@ -5,8 +5,9 @@ import psycopg
 import pytest
 import pytest_asyncio
 
-from py_app_runner.migrations._service import connect_kwargs, migrations_settings
+from py_app_runner.migrations._service import Target, connect_kwargs, resolve_targets
 from py_app_runner.migrations.commands import cmd_apply, cmd_baseline, cmd_new, cmd_repair, cmd_status
+from py_app_runner.migrations.discovery import MigrationError
 from py_app_runner.migrations.tracker import Tracker
 from tests.migrations_pg import dsn, pg_dsn_for
 
@@ -658,23 +659,110 @@ class TestServiceConfig:
         assert result["port"] == 5432
         assert result["sslmode"] == "prefer"
 
-    def test_settings_default_when_config_has_no_migrations_key(self, tmp_path):
-        directory, table = migrations_settings({"current_path": str(tmp_path)})
+    def test_resolve_targets_default_when_config_has_no_migrations_key(self, tmp_path):
+        targets = resolve_targets({"current_path": str(tmp_path)})
 
-        assert directory == tmp_path / "data" / "migrations"
-        assert table == "migrations"
+        assert list(targets) == ["main"]
+        assert targets["main"] == Target(
+            name="main", db="main", directory=tmp_path / "data" / "migrations", table="migrations"
+        )
 
-    def test_settings_honour_explicit_values(self, tmp_path):
-        directory, table = migrations_settings(
+    def test_resolve_targets_default_when_migrations_key_is_empty(self, tmp_path):
+        targets = resolve_targets({"current_path": str(tmp_path), "migrations": {}})
+
+        assert list(targets) == ["main"]
+        assert targets["main"] == Target(
+            name="main", db="main", directory=tmp_path / "data" / "migrations", table="migrations"
+        )
+
+    def test_resolve_targets_honour_flat_explicit_values(self, tmp_path):
+        targets = resolve_targets(
             {"current_path": str(tmp_path), "migrations": {"dir": "sql/steps", "table": "schema_history"}}
         )
 
-        assert directory == tmp_path / "sql" / "steps"
-        assert table == "schema_history"
-
-    def test_settings_accept_an_absolute_dir(self, tmp_path):
-        directory, _table = migrations_settings(
-            {"current_path": "/somewhere/else", "migrations": {"dir": str(tmp_path)}}
+        assert list(targets) == ["main"]
+        assert targets["main"] == Target(
+            name="main", db="main", directory=tmp_path / "sql" / "steps", table="schema_history"
         )
 
-        assert directory == tmp_path
+    def test_resolve_targets_flat_shape_accepts_an_absolute_dir(self, tmp_path):
+        targets = resolve_targets({"current_path": "/somewhere/else", "migrations": {"dir": str(tmp_path)}})
+
+        assert targets["main"].directory == tmp_path
+
+    def test_resolve_targets_new_shape_preserves_declaration_order(self, tmp_path):
+        targets = resolve_targets(
+            {
+                "current_path": str(tmp_path),
+                "db": {"main": {}, "gis": {}},
+                "migrations": {
+                    "targets": {
+                        "main": {"db": "main", "dir": "data/migrations", "table": "migrations"},
+                        "gis": {"db": "gis", "dir": "data/migrations_gis", "table": "gis_migrations"},
+                    }
+                },
+            }
+        )
+
+        assert list(targets) == ["main", "gis"]
+        assert targets["main"] == Target(
+            name="main", db="main", directory=tmp_path / "data" / "migrations", table="migrations"
+        )
+        assert targets["gis"] == Target(
+            name="gis", db="gis", directory=tmp_path / "data" / "migrations_gis", table="gis_migrations"
+        )
+
+    def test_resolve_targets_per_target_defaults(self, tmp_path):
+        targets = resolve_targets(
+            {"current_path": str(tmp_path), "db": {"gis": {}}, "migrations": {"targets": {"gis": {}}}}
+        )
+
+        assert targets["gis"] == Target(
+            name="gis", db="gis", directory=tmp_path / "data" / "migrations", table="migrations"
+        )
+
+    def test_resolve_targets_new_shape_relative_dir_resolves_against_current_path(self, tmp_path):
+        targets = resolve_targets(
+            {
+                "current_path": str(tmp_path),
+                "db": {"gis": {}},
+                "migrations": {"targets": {"gis": {"dir": "sql/gis"}}},
+            }
+        )
+
+        assert targets["gis"].directory == tmp_path / "sql" / "gis"
+
+    def test_resolve_targets_new_shape_absolute_dir_passes_through(self, tmp_path):
+        targets = resolve_targets(
+            {
+                "current_path": "/somewhere/else",
+                "db": {"gis": {}},
+                "migrations": {"targets": {"gis": {"dir": str(tmp_path)}}},
+            }
+        )
+
+        assert targets["gis"].directory == tmp_path
+
+    def test_resolve_targets_unknown_db_raises(self, tmp_path):
+        with pytest.raises(MigrationError, match="gis.*db"):
+            resolve_targets(
+                {
+                    "current_path": str(tmp_path),
+                    "db": {"main": {}},
+                    "migrations": {"targets": {"gis": {"db": "gis"}}},
+                }
+            )
+
+    def test_resolve_targets_empty_targets_raises(self, tmp_path):
+        with pytest.raises(MigrationError, match="targets"):
+            resolve_targets({"current_path": str(tmp_path), "db": {"main": {}}, "migrations": {"targets": {}}})
+
+    def test_resolve_targets_flat_keys_alongside_targets_raises(self, tmp_path):
+        with pytest.raises(MigrationError, match="dir"):
+            resolve_targets(
+                {
+                    "current_path": str(tmp_path),
+                    "db": {"main": {}},
+                    "migrations": {"dir": "sql/steps", "targets": {"main": {}}},
+                }
+            )
