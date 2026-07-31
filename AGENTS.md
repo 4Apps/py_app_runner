@@ -69,22 +69,58 @@ Client (HTTP or WS)
 
 ### Migrations (`migrations/`)
 
-Built-in service that applies tracked SQL files to `config["db"]["main"]`. Enabled by
-adding `migrations` to `SERVICES`; omit it and nothing is imported.
+Built-in service that applies tracked SQL files to one or more configured databases.
+Enabled by adding `migrations` to `SERVICES`; omit it and nothing is imported.
 
 ```
-python3 src/app.py migrations status   [--check]
-python3 src/app.py migrations apply    [--dry-run] [--to PREFIX]
-python3 src/app.py migrations baseline [--to PREFIX] [--yes]
-python3 src/app.py migrations new      <name>
-python3 src/app.py migrations repair   <filename>
+python3 src/app.py migrations status   [--check] [--target NAME]
+python3 src/app.py migrations apply    [--dry-run] [--to PREFIX] [--target NAME]
+python3 src/app.py migrations baseline [--to PREFIX] [--yes] [--target NAME]
+python3 src/app.py migrations new      <name> [--target NAME]
+python3 src/app.py migrations repair   <filename> [--target NAME]
 ```
 
+By default there is exactly one target, named `main`, against `config["db"]["main"]`.
 Files live in `config["migrations"]["dir"]` (default `data/migrations`, relative to
 `current_path`) and are named `YYYY-MM-DD-HHMMSS-kebab-name.sql`. The timestamp prefix both
 orders them and keeps two feature branches from colliding the way sequential numbers do.
 The tracking table is `config["migrations"]["table"]` (default `migrations`) - override it
-when that name is already taken by something else in the database.
+when that name is already taken by something else in the database. **This is the shape
+every project ships today and it needs no config change** - an absent `migrations` key, an
+empty one, and this flat `{"dir", "table"}` shape all resolve to that same single `main`
+target.
+
+A project that needs to migrate a second database (for example a GIS database alongside
+the main one) opts in with `config["migrations"]["targets"]`:
+
+```python
+"migrations": {
+    "targets": {
+        "main": {"db": "main", "dir": "data/migrations", "table": "migrations"},
+        "gis": {"db": "gis", "dir": "data/migrations_gis", "table": "gis_migrations"},
+    }
+}
+```
+
+Each entry's `db` names a key under `config["db"]` and defaults to the target's own name;
+`dir` and `table` default the same way as the flat shape. Mixing `targets` with a top-level
+`dir`/`table` is rejected as a config mistake rather than merged. With `targets` present:
+
+- `status` and `apply` with no `--target` run every target, in declared order. `apply`
+  stops at the first target that fails, so a broken first target never leaves you
+  half-migrated across two databases; `status --check` checks all of them before exiting,
+  and exits 1 if any has pending or blocked work.
+- `new`, `repair` and `baseline` need `--target` once more than one target is configured,
+  and refuse otherwise, naming the configured targets - guessing is not acceptable here
+  because a mis-stamped `baseline` produces a permanently green `status` over a database
+  that never got its tables. With exactly one target (the default case) they need no flag.
+- An unknown `--target` exits 1 naming the configured targets.
+- Each target gets its own connection and its own advisory lock, and targets are processed
+  strictly in sequence, never concurrently - two targets may legitimately point at the same
+  physical database, and concurrent processing would make the shared advisory lock contend
+  with itself.
+- Output gets a `[name] ` prefix only when more than one target is being processed;
+  single-target output is unchanged from before targets existed.
 
 - Each file runs in its own transaction, with its tracking row written inside that same
   transaction - a migration either fully lands and is recorded, or neither. Put
@@ -129,8 +165,9 @@ when that name is already taken by something else in the database.
   before restarting services against a half-migrated database. `runner.py` catches
   `Exception` around `init_service` and returns normally, which would exit 0 - deliberate
   for a long-running service, fatal here - so `migrations/_service.py` converts any
-  non-`SystemExit` failure (unreachable database, permissions error, dropped connection)
-  into `SystemExit(1)` itself. Do not "simplify" that away.
+  non-`SystemExit` failure (unreachable database, permissions error, dropped connection,
+  or a misconfigured `targets` block) into `SystemExit(1)` itself. Do not "simplify" that
+  away.
 - `commands.py` is importable directly for programmatic use (for example, building a
   throwaway database in a test harness). `cmd_apply`, `cmd_baseline` and `cmd_repair`
   require an autocommit connection and refuse otherwise, since each opens and closes its
