@@ -29,8 +29,12 @@ python3 src/app.py migrations repair   <filename>
 
 - Migrations no longer need to be idempotent - each file runs in its own transaction with
   its tracking row written inside it, so what already ran is always known.
-- Editing an applied file is detected as drift and blocks `apply` until reverted or repaired.
+- Editing an applied file is detected as drift, and a tracked file that has since been
+  deleted shows as missing; both block `apply` until resolved.
 - Files must not contain psql meta-commands (`\restrict` / `\unrestrict`, as emitted by
   `pg_dump`) - psycopg cannot execute them, and `apply` refuses such a file up front.
 - `baseline` adopts an existing database into the system: it writes tracking rows without
   executing anything.
+- Every subcommand exits non-zero on failure; `status --check` exits 1 if anything is
+  pending, drifted or missing, so a deploy script can halt before restarting services
+  against a half-migrated database.

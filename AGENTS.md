@@ -72,11 +72,13 @@ Client (HTTP or WS)
 Built-in service that applies tracked SQL files to `config["db"]["main"]`. Enabled by
 adding `migrations` to `SERVICES`; omit it and nothing is imported.
 
-    python3 src/app.py migrations status   [--check]
-    python3 src/app.py migrations apply    [--dry-run] [--to PREFIX]
-    python3 src/app.py migrations baseline [--to PREFIX] [--yes]
-    python3 src/app.py migrations new      <name>
-    python3 src/app.py migrations repair   <filename>
+```
+python3 src/app.py migrations status   [--check]
+python3 src/app.py migrations apply    [--dry-run] [--to PREFIX]
+python3 src/app.py migrations baseline [--to PREFIX] [--yes]
+python3 src/app.py migrations new      <name>
+python3 src/app.py migrations repair   <filename>
+```
 
 Files live in `config["migrations"]["dir"]` (default `data/migrations`, relative to
 `current_path`) and are named `YYYY-MM-DD-HHMMSS-kebab-name.sql`. The timestamp prefix both
@@ -87,13 +89,24 @@ orders them and keeps two feature branches from colliding the way sequential num
   `-- migrations:no-transaction` on line 1 for `CREATE INDEX CONCURRENTLY` and friends.
 - Because what ran is recorded, **migrations do not need to be idempotent**.
 - A sha256 of each file is stored; editing an applied file shows as `DRIFT` and blocks
-  `apply` until it is reverted or `repair`ed.
+  `apply` until it is reverted or `repair`ed. A tracked migration whose file has since been
+  deleted (a rebase, a squash, someone pruning old files) shows as `MISSING` and blocks
+  `apply` the same way - the database claims to have run something the repository can no
+  longer show, so nobody can tell whether the schema still matches.
 - Files must not contain psql meta-commands. `pg_dump` emits `\restrict` / `\unrestrict`,
   and psycopg has no psql to interpret them - `apply` refuses such a file up front.
 - `apply` holds a session advisory lock for the whole run, so two containers starting at
   once serialise instead of racing.
 - `baseline` is how an existing database adopts the system: it writes tracking rows without
   executing anything.
+- `status --check` exits 1 if anything is pending or drifted/missing, so a deploy script
+  can assert a clean state without parsing output. Every subcommand exits non-zero on
+  failure, which is what makes `apply` safe to run unattended in a playbook that must halt
+  before restarting services against a half-migrated database.
+- `commands.py` is importable directly for programmatic use (for example, building a
+  throwaway database in a test harness). `cmd_apply`, `cmd_baseline` and `cmd_repair`
+  require an autocommit connection and refuse otherwise, since each opens and closes its
+  own per-file transactions rather than running inside one the caller opened.
 
 ### Bridge Subsystem (`bridge/`)
 
