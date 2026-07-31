@@ -59,10 +59,41 @@ Client (HTTP or WS)
 ### Core Components
 
 - **`runner.py`** — CLI entrypoint (`main()`). Parses args, sets up logging/Sentry, loads services via PyBridge, starts the async event loop (uvloop in prod).
-- **`pybridge.py`** — Dynamic service loader. Imports service modules from `services.<name>._service` / `_service_args` / `_service_pybridge` convention.
+- **`pybridge.py`** — Dynamic service loader. Imports service modules from
+  `services.<name>._service` / `_service_args` / `_service_pybridge`, falling back to
+  `py_app_runner.<name>.<module>` for built-ins (`bridge`, `migrations`). Project services
+  win, so a project can override a built-in by shipping its own module of the same name.
 - **`registry.py`** — `AppRegistry` singleton. Holds project-specific config, model classes, Redis channel, and web app class. Must be configured before runner starts.
 - **`config.py`** — `load_config()` loads `.env`, maps `ENV_VAR` names into nested dict keys by splitting on `_`. Only vars whose first key exists in defaults are processed. Helpers: `is_env_dev/test/prod`.
 - **`db_pools.py`** — Database connection pool management (PostgreSQL + Redis).
+
+### Migrations (`migrations/`)
+
+Built-in service that applies tracked SQL files to `config["db"]["main"]`. Enabled by
+adding `migrations` to `SERVICES`; omit it and nothing is imported.
+
+    python3 src/app.py migrations status   [--check]
+    python3 src/app.py migrations apply    [--dry-run] [--to PREFIX]
+    python3 src/app.py migrations baseline [--to PREFIX] [--yes]
+    python3 src/app.py migrations new      <name>
+    python3 src/app.py migrations repair   <filename>
+
+Files live in `config["migrations"]["dir"]` (default `data/migrations`, relative to
+`current_path`) and are named `YYYY-MM-DD-HHMMSS-kebab-name.sql`. The timestamp prefix both
+orders them and keeps two feature branches from colliding the way sequential numbers do.
+
+- Each file runs in its own transaction, with its tracking row written inside that same
+  transaction - a migration either fully lands and is recorded, or neither. Put
+  `-- migrations:no-transaction` on line 1 for `CREATE INDEX CONCURRENTLY` and friends.
+- Because what ran is recorded, **migrations do not need to be idempotent**.
+- A sha256 of each file is stored; editing an applied file shows as `DRIFT` and blocks
+  `apply` until it is reverted or `repair`ed.
+- Files must not contain psql meta-commands. `pg_dump` emits `\restrict` / `\unrestrict`,
+  and psycopg has no psql to interpret them - `apply` refuses such a file up front.
+- `apply` holds a session advisory lock for the whole run, so two containers starting at
+  once serialise instead of racing.
+- `baseline` is how an existing database adopts the system: it writes tracking rows without
+  executing anything.
 
 ### Bridge Subsystem (`bridge/`)
 
