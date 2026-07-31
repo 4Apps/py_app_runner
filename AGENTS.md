@@ -83,16 +83,40 @@ python3 src/app.py migrations repair   <filename>
 Files live in `config["migrations"]["dir"]` (default `data/migrations`, relative to
 `current_path`) and are named `YYYY-MM-DD-HHMMSS-kebab-name.sql`. The timestamp prefix both
 orders them and keeps two feature branches from colliding the way sequential numbers do.
+The tracking table is `config["migrations"]["table"]` (default `migrations`) - override it
+when that name is already taken by something else in the database.
 
 - Each file runs in its own transaction, with its tracking row written inside that same
   transaction - a migration either fully lands and is recorded, or neither. Put
   `-- migrations:no-transaction` on line 1 for `CREATE INDEX CONCURRENTLY` and friends.
+- **A no-transaction file must contain exactly one statement.** Postgres wraps a
+  multi-statement simple-Query send in an *implicit* transaction, so the directive would
+  silently not take effect; the whole file goes to `cur.execute()` in one call and there is
+  no statement splitter. `apply` counts statements during its pre-flight scan and refuses
+  such a file before executing anything. The count is crude (strip `--` comments, split on
+  `;`), so it over-counts a dollar-quoted body - acceptable, since that is a loud refusal at
+  scan time and no dollar-quoted function body needs this directive.
+- A **failed** no-transaction file cannot roll back and is not recorded. `apply` says so
+  explicitly: it may have partially applied (a failed `CREATE INDEX CONCURRENTLY` leaves an
+  invalid index behind, and a re-run then dies on `relation already exists`), so inspect the
+  database before re-running.
 - Because what ran is recorded, **migrations do not need to be idempotent**.
 - A sha256 of each file is stored; editing an applied file shows as `DRIFT` and blocks
   `apply` until it is reverted or `repair`ed. A tracked migration whose file has since been
   deleted (a rebase, a squash, someone pruning old files) shows as `MISSING` and blocks
   `apply` the same way - the database claims to have run something the repository can no
   longer show, so nobody can tell whether the schema still matches.
+- `repair` is the DRIFT remedy only; it re-reads the file to re-stamp its checksum, so for
+  `MISSING` it can only answer "no such migration file". The remedies for `MISSING` are to
+  restore the file from version control, or - if it is gone for good and its schema change
+  is known to be in place - to delete the tracking row by hand:
+  `DELETE FROM migrations WHERE name = '<name>';`. `apply` prints that statement, with the
+  configured table name filled in, when it blocks on a `MISSING` state.
+- The tracking table is created with `CREATE TABLE IF NOT EXISTS`, which matches on name
+  alone. Its columns are verified straight afterwards, so an unrelated pre-existing
+  `migrations` table is reported as such - naming the missing columns and pointing at the
+  `config["migrations"]["table"]` override - rather than being adopted and failing later
+  with a bare `column "name" does not exist`.
 - Files must not contain psql meta-commands. `pg_dump` emits `\restrict` / `\unrestrict`,
   and psycopg has no psql to interpret them - `apply` refuses such a file up front.
 - `apply` holds a session advisory lock for the whole run, so two containers starting at
@@ -102,7 +126,11 @@ orders them and keeps two feature branches from colliding the way sequential num
 - `status --check` exits 1 if anything is pending or drifted/missing, so a deploy script
   can assert a clean state without parsing output. Every subcommand exits non-zero on
   failure, which is what makes `apply` safe to run unattended in a playbook that must halt
-  before restarting services against a half-migrated database.
+  before restarting services against a half-migrated database. `runner.py` catches
+  `Exception` around `init_service` and returns normally, which would exit 0 - deliberate
+  for a long-running service, fatal here - so `migrations/_service.py` converts any
+  non-`SystemExit` failure (unreachable database, permissions error, dropped connection)
+  into `SystemExit(1)` itself. Do not "simplify" that away.
 - `commands.py` is importable directly for programmatic use (for example, building a
   throwaway database in a test harness). `cmd_apply`, `cmd_baseline` and `cmd_repair`
   require an autocommit connection and refuse otherwise, since each opens and closes its
