@@ -6,6 +6,7 @@ import pytest
 from py_app_runner.migrations.discovery import (
     MigrationError,
     checksum_bytes,
+    count_statements,
     discover,
     find_meta_commands,
     load_migration,
@@ -131,3 +132,35 @@ class TestNewFilename:
         now = datetime.datetime(2026, 8, 4, 9, 15, 30, tzinfo=datetime.UTC)
         with pytest.raises(MigrationError, match="name"):
             new_filename("!!!", now)
+
+
+class TestCountStatements:
+    """Backs `apply`'s refusal of a multi-statement no-transaction file. Deliberately crude:
+    it only has to tell "exactly one" from "more than one"."""
+
+    def test_a_single_statement_with_a_trailing_semicolon(self):
+        assert count_statements("CREATE INDEX CONCURRENTLY a_id_idx ON a (id);\n") == 1
+
+    def test_a_single_statement_without_a_trailing_semicolon(self):
+        assert count_statements("CREATE INDEX CONCURRENTLY a_id_idx ON a (id)\n") == 1
+
+    def test_the_directive_and_comments_do_not_count(self):
+        sql = "-- migrations:no-transaction\n-- why: locks\nCREATE INDEX CONCURRENTLY a ON t (id);\n"
+        assert count_statements(sql) == 1
+
+    def test_a_semicolon_inside_a_comment_does_not_count(self):
+        assert count_statements("CREATE TABLE t (); -- one; two; three\n") == 1
+
+    def test_two_statements(self):
+        assert count_statements("CREATE INDEX CONCURRENTLY a ON t (id);\nCREATE INDEX CONCURRENTLY b ON t (x);") == 2
+
+    def test_an_empty_file_counts_as_none(self):
+        assert count_statements("-- nothing here\n\n") == 0
+
+    def test_a_dollar_quoted_body_is_over_counted_by_design(self):
+        """The documented limitation: a semicolon inside $$ ... $$ reads as a separator. The
+        cost is a loud refusal at scan time on a file that would never carry the directive
+        anyway, which is the trade the crude count buys."""
+
+        sql = "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql;"
+        assert count_statements(sql) > 1

@@ -11,6 +11,8 @@ NO_TRANSACTION_DIRECTIVE = "-- migrations:no-transaction"
 # server directly - there is no psql to interpret these, so they arrive as syntax errors.
 _META_COMMAND_RE = re.compile(r"^\s*\\")
 
+_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+
 
 class MigrationError(Exception):
     """Anything wrong with the migration files themselves, as opposed to the SQL failing."""
@@ -83,6 +85,19 @@ def find_meta_commands(sql: str) -> list[tuple[int, str]]:
         for number, line in enumerate(sql.split("\n"), start=1)
         if _META_COMMAND_RE.match(line)
     ]
+
+
+def count_statements(sql: str) -> int:
+    """Crude statement count: strip `--` comments, split on `;`, count non-empty remainders.
+
+    A semicolon inside a dollar-quoted block or a string literal is counted as a separator
+    here, so such a file is over-counted. That is acceptable because the only caller uses this
+    to *refuse* a multi-statement no-transaction file before anything executes - the
+    false positive is a loud refusal at scan time, and the operations the no-transaction
+    directive exists for (CREATE INDEX CONCURRENTLY and friends) are never dollar-quoted.
+    """
+
+    return len([part for part in _LINE_COMMENT_RE.sub("", sql).split(";") if part.strip()])
 
 
 def new_filename(name: str, now: datetime) -> str:
