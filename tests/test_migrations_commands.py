@@ -1,16 +1,14 @@
 import datetime
 import pathlib
 
+import psycopg
 import pytest
 import pytest_asyncio
 
+from py_app_runner.migrations._service import connect_kwargs, migrations_settings
 from py_app_runner.migrations.commands import cmd_apply, cmd_baseline, cmd_new, cmd_repair, cmd_status
 from py_app_runner.migrations.tracker import Tracker
 from tests.migrations_pg import dsn, pg_dsn_for
-
-psycopg = pytest.importorskip("psycopg")
-
-from py_app_runner.migrations._service import connect_kwargs, migrations_settings  # noqa: E402
 
 
 @pytest_asyncio.fixture

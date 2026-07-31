@@ -8,13 +8,22 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
+    # `depends_on` alone only orders startup. The migration integration tests need Postgres
+    # to actually accept connections, or a CI run started a second too early tests nothing.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
 
   # Development
   develop:
     container_name: py_app_runner_develop
     restart: "no"
     depends_on:
-      - main_db
+      main_db:
+        condition: service_healthy
     build:
       context: .
       dockerfile: ./docker/app/Dockerfile

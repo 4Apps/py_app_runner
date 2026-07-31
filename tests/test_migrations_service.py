@@ -8,14 +8,13 @@ import logging
 import socket
 from argparse import Namespace
 
+import psycopg
 import pytest
 
 from py_app_runner.migrations._service import init_service
 from py_app_runner.migrations._service_args import reg_subparsers
 from py_app_runner.registry import AppRegistry
 from tests.migrations_pg import PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, pg_dsn_for
-
-psycopg = pytest.importorskip("psycopg")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,13 +1,12 @@
 import asyncio
 import datetime
 
+import psycopg
 import pytest
 import pytest_asyncio
 
 from py_app_runner.migrations.tracker import Tracker
 from tests.migrations_pg import dsn, pg_dsn_for
-
-psycopg = pytest.importorskip("psycopg")
 
 
 @pytest_asyncio.fixture
