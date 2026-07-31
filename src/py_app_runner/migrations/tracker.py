@@ -69,7 +69,7 @@ class Tracker:
         """
 
         async with self.conn.cursor() as cur:
-            await cur.execute(_COLUMNS_SQL, (self.table.as_string(),))
+            await cur.execute(_COLUMNS_SQL, (self.table.as_string(self.conn),))
             found = {row[0] for row in await cur.fetchall()}
 
         missing = EXPECTED_COLUMNS - found

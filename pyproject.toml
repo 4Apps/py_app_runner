@@ -21,8 +21,11 @@ dependencies = [
     "database_wrapper == 0.2.38",
     "database_wrapper[pgsql] == 0.2.38",
     "database_wrapper[redis] == 0.2.38",
-    "psycopg",
-    "psycopg[pool]",
+    # Used directly by py_app_runner.migrations, not only through database_wrapper, so the
+    # floor is declared here rather than inherited. Matches database_wrapper_pgsql 0.2.38's
+    # own psycopg[binary]/psycopg[pool] >= 3.2.0.
+    "psycopg >= 3.2.0",
+    "psycopg[pool] >= 3.2.0",
     "redis",
     "pyjwt",
 ]
