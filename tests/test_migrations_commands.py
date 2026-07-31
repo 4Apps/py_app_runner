@@ -210,6 +210,133 @@ class TestApply:
             "2026-08-05-091530-b.sql",
         ]
 
+    async def test_refuses_a_multi_statement_no_transaction_file(self, conn, migrations_dir, printed):
+        """Postgres wraps a multi-statement simple-Query send in an implicit transaction, so
+        the directive silently does not take effect - `CREATE INDEX CONCURRENTLY` then dies
+        with "cannot run inside a transaction block". Refuse at scan time instead."""
+
+        lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        write(
+            migrations_dir,
+            "2026-08-05-091530-b.sql",
+            "-- migrations:no-transaction\n"
+            "CREATE INDEX CONCURRENTLY a_id_idx ON a (id);\n"
+            "CREATE INDEX CONCURRENTLY a_id_idx2 ON a (id);\n",
+        )
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+        assert any("more than one statement" in line for line in lines)
+
+        # The scan runs before anything executes, so even the earlier, valid file is untouched.
+        assert not await table_exists(conn, "a")
+        assert await Tracker(conn).applied_rows() == []
+
+    async def test_a_multi_statement_no_transaction_file_is_refused_in_dry_run_too(
+        self, conn, migrations_dir, printed
+    ):
+        lines, out = printed
+        write(
+            migrations_dir,
+            "2026-08-04-091530-a.sql",
+            "-- migrations:no-transaction\nCREATE TABLE a (id int);\nCREATE TABLE b (id int);\n",
+        )
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", True, None, "test", out) == 1
+        assert any("more than one statement" in line for line in lines)
+
+    async def test_a_multi_statement_file_without_the_directive_is_still_fine(
+        self, conn, migrations_dir, printed
+    ):
+        _lines, out = printed
+        write(
+            migrations_dir,
+            "2026-08-04-091530-a.sql",
+            "CREATE TABLE a (id int);\nCREATE TABLE b (id int);",
+        )
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 0
+
+    async def test_a_failed_no_transaction_file_does_not_claim_a_clean_stop(
+        self, conn, migrations_dir, printed
+    ):
+        """Nothing rolls back outside a transaction: a failed CREATE UNIQUE INDEX
+        CONCURRENTLY leaves an invalid index behind and no tracking row, so a re-run dies on
+        "relation already exists". The message must say so, not "nothing was applied"."""
+
+        lines, out = printed
+        write(
+            migrations_dir,
+            "2026-08-04-091530-a.sql",
+            "CREATE TABLE a (id int);\nINSERT INTO a VALUES (1), (1);",
+        )
+        write(
+            migrations_dir,
+            "2026-08-05-091530-b.sql",
+            "-- migrations:no-transaction\nCREATE UNIQUE INDEX CONCURRENTLY a_id_uidx ON a (id);",
+        )
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+        assert any("OUTSIDE a transaction" in line for line in lines)
+        assert any("PARTIALLY applied" in line for line in lines)
+        assert not any("Nothing after this migration was applied" in line for line in lines)
+
+        # Not just wording: the leftover invalid index really is there.
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('a_id_uidx')")
+            assert (await cur.fetchone())[0] is False
+
+    async def test_a_failed_transactional_file_keeps_the_clean_stop_wording(
+        self, conn, migrations_dir, printed
+    ):
+        lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "THIS IS NOT SQL;")
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+        assert any("Nothing after this migration was applied" in line for line in lines)
+        assert not any("OUTSIDE a transaction" in line for line in lines)
+
+    async def test_missing_advice_does_not_point_at_repair(self, conn, migrations_dir, printed):
+        """`repair` re-reads the file to re-stamp its checksum, so for MISSING it can only
+        answer "no such migration file". The shared footer used to send operators there
+        anyway, with the one working remedy documented nowhere."""
+
+        lines, out = printed
+        path = write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out)
+        path.unlink()
+        write(migrations_dir, "2026-08-05-091530-b.sql", "CREATE TABLE b (id int);")
+        lines.clear()
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+        assert any("DELETE FROM migrations WHERE name = '2026-08-04-091530-a.sql';" in line for line in lines)
+        assert any("cannot help" in line for line in lines)
+        assert not any("run `migrations repair" in line for line in lines)
+
+        # And the command the old footer pointed at really does refuse.
+        assert await cmd_repair(conn, migrations_dir, "migrations", "2026-08-04-091530-a.sql", out) == 1
+
+    async def test_drift_advice_still_points_at_repair(self, conn, migrations_dir, printed):
+        lines, out = printed
+        path = write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out)
+        path.write_text("CREATE TABLE a (id int); -- edited")
+        write(migrations_dir, "2026-08-05-091530-b.sql", "CREATE TABLE b (id int);")
+        lines.clear()
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+        assert any("run `migrations repair" in line for line in lines)
+        assert not any("DELETE FROM" in line for line in lines)
+
+    async def test_reports_a_hijacked_tracking_table_instead_of_crashing(self, conn, migrations_dir, printed):
+        lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        async with conn.cursor() as cur:
+            await cur.execute("CREATE TABLE migrations (id serial primary key, version int)")
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+        assert any("is not a migration tracking table" in line for line in lines)
+
     async def test_records_duration_and_who_applied_it(self, conn, migrations_dir, printed):
         _lines, out = printed
         write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
@@ -407,11 +534,54 @@ class TestRepair:
         lines.clear()
         assert await cmd_status(conn, migrations_dir, "migrations", check=True, out=out) == 0
 
-    async def test_unknown_name_is_an_error(self, conn, migrations_dir, printed):
-        _lines, out = printed
+    async def test_a_file_with_no_tracking_row_is_an_error(self, conn, migrations_dir, printed):
+        """The file exists on disk but was never applied, so there is no checksum to re-stamp."""
+
+        lines, out = printed
         write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
 
         assert await cmd_repair(conn, migrations_dir, "migrations", "2026-08-04-091530-a.sql", out) == 1
+        assert any("no tracking row" in line for line in lines)
+
+    async def test_a_name_with_no_file_at_all_is_an_error(self, conn, migrations_dir, printed):
+        lines, out = printed
+
+        assert await cmd_repair(conn, migrations_dir, "migrations", "2026-08-04-091530-nope.sql", out) == 1
+        assert any("no such migration file" in line for line in lines)
+
+    async def test_a_path_outside_the_migrations_directory_is_refused(
+        self, conn, migrations_dir, printed, tmp_path
+    ):
+        """A traversing `name` used to stamp the *outside* file's checksum against the real
+        migration's name, reporting a successful repair while leaving it stuck in DRIFT."""
+
+        lines, out = printed
+        path = write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+        await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out)
+        path.write_text("CREATE TABLE a (id int); -- deliberate edit")
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "2026-08-04-091530-a.sql").write_text("SELECT 'something else entirely';")
+        lines.clear()
+
+        code = await cmd_repair(
+            conn, migrations_dir, "migrations", "../elsewhere/2026-08-04-091530-a.sql", out
+        )
+
+        assert code == 1
+        assert any("plain migration filename" in line for line in lines)
+
+        # The real migration is still in DRIFT, not falsely stamped with the outside checksum.
+        assert await cmd_status(conn, migrations_dir, "migrations", check=True, out=out) == 1
+        assert any("DRIFT" in line for line in lines)
+
+    async def test_an_absolute_path_is_refused(self, conn, migrations_dir, printed):
+        lines, out = printed
+        path = write(migrations_dir, "2026-08-04-091530-a.sql", "CREATE TABLE a (id int);")
+
+        assert await cmd_repair(conn, migrations_dir, "migrations", str(path), out) == 1
+        assert any("plain migration filename" in line for line in lines)
 
 
 class TestAutocommitGuard:

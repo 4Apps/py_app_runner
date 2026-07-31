@@ -7,6 +7,7 @@ import psycopg
 
 from py_app_runner.migrations.discovery import (
     MigrationError,
+    count_statements,
     discover,
     find_meta_commands,
     load_migration,
@@ -29,16 +30,29 @@ async def _load_states(
     return tracker, compute_states(files, rows)
 
 
-def _report_blocking(states: list[MigrationState], out: Out) -> None:
-    for state in blocking(states):
+def _report_blocking(states: list[MigrationState], table: str, out: Out) -> None:
+    """The two blocking states need different advice. `repair` re-reads the file to re-stamp
+    its checksum, so it is the DRIFT remedy and is useless for MISSING - pointing an operator
+    at it there just earns them "no such migration file"."""
+
+    blocked = blocking(states)
+    for state in blocked:
         if state.state is State.DRIFT:
             out(f"  {state.state:<8} {state.name}  (file changed after it was applied)")
         else:
             out(f"  {state.state:<8} {state.name}  (applied, but the file is gone)")
 
     out("")
-    out("Resolve these before applying: restore the file, revert the edit, or run")
-    out("`migrations repair <name>` if the edit was deliberate.")
+    if any(state.state is State.DRIFT for state in blocked):
+        out("DRIFT: revert the edit, or run `migrations repair <name>` if the edit was deliberate.")
+
+    for state in blocked:
+        if state.state is not State.MISSING:
+            continue
+
+        out(f"MISSING: {state.name} is gone, so `migrations repair` cannot help. Restore the file")
+        out("from version control, or - if it is gone for good and its schema change is known to")
+        out(f"be in place - drop the tracking row:  DELETE FROM {table} WHERE name = '{state.name}';")
 
 
 async def cmd_status(
@@ -107,7 +121,7 @@ async def cmd_apply(
             return 1
 
         if blocking(states):
-            _report_blocking(states, out)
+            _report_blocking(states, table, out)
             return 1
 
         queue = pending(states)
@@ -137,6 +151,17 @@ async def cmd_apply(
                 out("Strip them (pg_dump emits \\restrict / \\unrestrict) and try again.")
                 return 1
 
+            # Postgres wraps a multi-statement simple-Query message in an *implicit*
+            # transaction, so a no-transaction file only genuinely runs outside one when it
+            # holds exactly one statement. Since the whole file goes to `cur.execute()` in a
+            # single call with no statement splitter, the only honest answer is to refuse.
+            if state.file.no_transaction and count_statements(state.file.sql) > 1:
+                out(f"error: {state.name} is marked `-- migrations:no-transaction` but contains")
+                out("more than one statement. Postgres runs a multi-statement send inside an")
+                out("implicit transaction, which would defeat the directive. Split the file so")
+                out("each no-transaction migration contains exactly one statement.")
+                return 1
+
         for state in queue:
             assert state.file is not None
             if dry_run:
@@ -164,7 +189,17 @@ async def cmd_apply(
 
             except Exception as e:
                 out(f"FAILED {state.name}: {e}")
-                out("Stopped. Nothing after this migration was applied.")
+                if state.file.no_transaction:
+                    # No transaction means no rollback: a failed CREATE INDEX CONCURRENTLY
+                    # leaves an invalid index behind, and a re-run then dies on "relation
+                    # already exists". Claiming a clean stop here is what strands a deploy.
+                    out("This file ran OUTSIDE a transaction, so it may have PARTIALLY applied.")
+                    out("It was not recorded as applied. Inspect the database and undo whatever")
+                    out("landed (a failed CREATE INDEX CONCURRENTLY leaves an invalid index)")
+                    out("before re-running.")
+                else:
+                    out("Stopped. Nothing after this migration was applied.")
+
                 return 1
 
             out(f"applied {state.name} ({duration_ms} ms)")
@@ -181,6 +216,10 @@ _NEW_FILE_TEMPLATE = """-- {name}
 --
 -- Runs in a transaction. Add `-- migrations:no-transaction` as the very first line if this
 -- file needs CREATE INDEX CONCURRENTLY or anything else Postgres refuses inside one.
+--
+-- A no-transaction file must contain exactly ONE statement. Postgres wraps a
+-- multi-statement send in an implicit transaction, which would defeat the directive, so
+-- `apply` refuses such a file. Split it into one file per statement.
 """
 
 
@@ -313,6 +352,13 @@ async def cmd_repair(
         out("error: cmd_repair requires an autocommit connection")
         return 1
 
+    # A bare basename only. `directory / "../elsewhere/x.sql"` resolves outside the migrations
+    # directory, and stamping that file's checksum under its basename would leave the real
+    # migration permanently in DRIFT while reporting a successful repair.
+    if name != pathlib.PurePath(name).name:
+        out(f"error: {name!r} must be a plain migration filename, not a path")
+        return 1
+
     path = directory / name
     if not path.is_file():
         out(f"error: no such migration file: {path}")
@@ -325,7 +371,11 @@ async def cmd_repair(
         return 1
 
     tracker = Tracker(conn, table)
-    await tracker.ensure_table()
+    try:
+        await tracker.ensure_table()
+    except MigrationError as e:
+        out(f"error: {e}")
+        return 1
 
     if not await tracker.update_checksum(migration.name, migration.checksum):
         out(f"error: {migration.name} has no tracking row - it was never applied, so there is nothing to repair")
