@@ -60,18 +60,31 @@ async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Log
     applied_by = f"{config.get('app_version', 'unknown')} @ {socket.gethostname()}"
     logger.debug(f"migrations: dir={directory} table={table}")
 
-    async with await psycopg.AsyncConnection.connect(**connect_kwargs(config["db"]["main"])) as conn:
-        if args.step == "status":
-            code = await cmd_status(conn, directory, table, args.check, out)
-        elif args.step == "apply":
-            dry_run = getattr(args, "dry_run", False)
-            code = await cmd_apply(conn, directory, table, dry_run, args.to, applied_by, out)
-        elif args.step == "baseline":
-            code = await cmd_baseline(conn, directory, table, args.to, args.yes, applied_by, input, out)
-        elif args.step == "repair":
-            code = await cmd_repair(conn, directory, table, args.name, out)
-        else:
-            out(f"error: unknown migrations command {args.step!r}")
-            code = 1
+    # runner.py catches Exception around init_service, logs it and returns normally - which
+    # exits 0. For a long-running service that is deliberate, but here it would tell an
+    # unattended playbook that migrations succeeded when the database was merely unreachable,
+    # and the playbook would go on to restart services against an unmigrated schema. Silent
+    # success is the one outcome this tool must never produce, so every non-SystemExit failure
+    # is converted into a non-zero exit here, inside the service, without touching runner.py.
+    # SystemExit derives from BaseException, so the happy-path exit below is not re-wrapped.
+    code = 1
+    try:
+        async with await psycopg.AsyncConnection.connect(**connect_kwargs(config["db"]["main"])) as conn:
+            if args.step == "status":
+                code = await cmd_status(conn, directory, table, args.check, out)
+            elif args.step == "apply":
+                dry_run = getattr(args, "dry_run", False)
+                code = await cmd_apply(conn, directory, table, dry_run, args.to, applied_by, out)
+            elif args.step == "baseline":
+                code = await cmd_baseline(conn, directory, table, args.to, args.yes, applied_by, input, out)
+            elif args.step == "repair":
+                code = await cmd_repair(conn, directory, table, args.name, out)
+            else:
+                out(f"error: unknown migrations command {args.step!r}")
+                code = 1
+
+    except Exception:
+        logger.exception("migrations: unhandled failure")
+        raise SystemExit(1) from None
 
     raise SystemExit(code)
