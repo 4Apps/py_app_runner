@@ -318,6 +318,37 @@ class TestProcessExitCodes:
 
             assert excinfo.value.code == 1
 
+    async def test_a_misconfigured_targets_block_exits_one_rather_than_zero(self, tmp_path, saved_registry):
+        """The same bug as the two cases above, one layer up: `resolve_targets` and
+        `_select_targets` used to run outside the `try`, so a `MigrationError` from a typo'd
+        `db` key under config["migrations"]["targets"] propagated straight past
+        `init_service` - runner.py's own `except Exception` around `init_service` would log
+        it and return, exiting 0 as if migrations had succeeded."""
+
+        config = {
+            "current_path": str(tmp_path),
+            "db": {
+                "main": {
+                    "hostname": PG_HOST,
+                    "port": PG_PORT,
+                    "username": PG_USER,
+                    "password": PG_PASSWORD,
+                    "database": "irrelevant",
+                }
+            },
+            # "gis" names db "typo_gis", which is not a key under config["db"] - resolve_targets
+            # must refuse this before any connection is attempted.
+            "migrations": {"targets": {"gis": {"db": "typo_gis"}}},
+        }
+        AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+        with pytest.raises(SystemExit) as excinfo:
+            await init_service(
+                Namespace(step="apply", dry_run=False, to=None, target=None), None, logging.getLogger("test")
+            )
+
+        assert excinfo.value.code == 1
+
     async def test_the_happy_path_exit_code_is_not_re_wrapped(self, tmp_path, saved_registry):
         """`SystemExit` derives from `BaseException`, so the new `except Exception` must not
         catch the normal exit and turn a successful apply into a failure."""

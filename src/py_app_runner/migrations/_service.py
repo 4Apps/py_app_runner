@@ -168,27 +168,44 @@ def _select_targets(step: str, requested: str | None, targets: dict[str, Target]
 
 async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Logger) -> None:
     config = AppRegistry.config()
-    targets = resolve_targets(config)
-    selected = _select_targets(args.step, getattr(args, "target", None), targets)
-    multi = len(selected) > 1
-
-    if args.step == "new":
-        # Synchronous and needs no database - dispatched before any connection is opened.
-        # _select_targets already refused ambiguity above, so exactly one target here.
-        target = selected[0]
-        raise SystemExit(cmd_new(target.directory, args.name, datetime.now(UTC), _out_for(target.name, multi)))
-
-    applied_by = f"{config.get('app_version', 'unknown')} @ {socket.gethostname()}"
 
     # runner.py catches Exception around init_service, logs it and returns normally - which
     # exits 0. For a long-running service that is deliberate, but here it would tell an
-    # unattended playbook that migrations succeeded when the database was merely unreachable,
-    # and the playbook would go on to restart services against an unmigrated schema. Silent
-    # success is the one outcome this tool must never produce, so every non-SystemExit failure
-    # is converted into a non-zero exit here, inside the service, without touching runner.py.
-    # SystemExit derives from BaseException, so the happy-path exit below is not re-wrapped.
-    code = 0
+    # unattended playbook that migrations succeeded when the database was merely unreachable
+    # (or, for a multi-target config, mis-declared - an unknown `db` key under
+    # config["migrations"]["targets"] is exactly what resolve_targets raises on), and the
+    # playbook would go on to restart services against an unmigrated schema. Silent success
+    # is the one outcome this tool must never produce, so every non-SystemExit failure -
+    # config resolution included, not just the database connection - is converted into a
+    # non-zero exit here, inside the service, without touching runner.py. SystemExit derives
+    # from BaseException, so _select_targets's own refusals and the happy-path exit below are
+    # not re-wrapped.
+    code = 1
     try:
+        targets = resolve_targets(config)
+        selected = _select_targets(args.step, getattr(args, "target", None), targets)
+        if not selected:
+            # resolve_targets always returns at least one target, and _select_targets never
+            # returns empty on a path that doesn't already SystemExit - this guards that
+            # invariant rather than trusting it. Falling through silently would exit 0 with
+            # nothing having run, which is exactly the failure mode this function exists to
+            # prevent.
+            raise RuntimeError("migrations: no targets selected; this should be unreachable")
+
+        multi = len(selected) > 1
+
+        if args.step == "new":
+            # Synchronous and needs no database - dispatched before any connection is
+            # opened. _select_targets already refused ambiguity above, so exactly one
+            # target here.
+            target = selected[0]
+            raise SystemExit(
+                cmd_new(target.directory, args.name, datetime.now(UTC), _out_for(target.name, multi))
+            )
+
+        applied_by = f"{config.get('app_version', 'unknown')} @ {socket.gethostname()}"
+
+        code = 0
         # One connection per target, processed strictly in sequence: two targets can point at
         # the same physical database (e.g. a dev box collapsing "main" and "gis"), and the
         # advisory lock tracker.lock() takes would contend with itself under concurrency.
