@@ -51,12 +51,19 @@ class Target:
     table: str
 
 
-def _resolve_directory(raw_dir: str | None, current_path: Any) -> pathlib.Path:
+def _resolve_directory(raw_dir: str | None, config: dict[str, Any]) -> pathlib.Path:
     directory = pathlib.Path(raw_dir or _DEFAULT_DIR)
-    if not directory.is_absolute():
-        directory = pathlib.Path(current_path) / directory
+    if directory.is_absolute():
+        return directory
 
-    return directory
+    current_path = config.get("current_path")
+    if current_path is None:
+        raise MigrationError(
+            f'migrations dir {str(directory)!r} is relative but config has no "current_path" to '
+            f"resolve it against; either set current_path or use an absolute dir."
+        )
+
+    return pathlib.Path(current_path) / directory
 
 
 def resolve_targets(config: dict[str, Any]) -> dict[str, Target]:
@@ -87,7 +94,6 @@ def resolve_targets(config: dict[str, Any]) -> dict[str, Target]:
             )
 
         db_config = config.get("db") or {}
-        current_path = config["current_path"]
         targets: dict[str, Target] = {}
         for name, raw_entry in raw_targets.items():
             entry = raw_entry or {}
@@ -100,13 +106,13 @@ def resolve_targets(config: dict[str, Any]) -> dict[str, Target]:
             targets[name] = Target(
                 name=name,
                 db=db_name,
-                directory=_resolve_directory(entry.get("dir"), current_path),
+                directory=_resolve_directory(entry.get("dir"), config),
                 table=entry.get("table") or _DEFAULT_TABLE,
             )
 
         return targets
 
-    directory = _resolve_directory(settings.get("dir"), config["current_path"])
+    directory = _resolve_directory(settings.get("dir"), config)
     table = settings.get("table") or _DEFAULT_TABLE
     target = Target(name=_DEFAULT_TARGET_NAME, db=_DEFAULT_TARGET_NAME, directory=directory, table=table)
     return {_DEFAULT_TARGET_NAME: target}

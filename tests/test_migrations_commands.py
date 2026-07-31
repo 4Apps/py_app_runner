@@ -690,6 +690,15 @@ class TestServiceConfig:
 
         assert targets["main"].directory == tmp_path
 
+    def test_resolve_targets_flat_shape_absolute_dir_needs_no_current_path(self, tmp_path):
+        targets = resolve_targets({"migrations": {"dir": str(tmp_path)}})
+
+        assert targets["main"].directory == tmp_path
+
+    def test_resolve_targets_flat_shape_relative_dir_without_current_path_raises(self):
+        with pytest.raises(MigrationError, match="current_path"):
+            resolve_targets({"migrations": {"dir": "sql/steps"}})
+
     def test_resolve_targets_new_shape_preserves_declaration_order(self, tmp_path):
         targets = resolve_targets(
             {
@@ -742,6 +751,15 @@ class TestServiceConfig:
         )
 
         assert targets["gis"].directory == tmp_path
+
+    def test_resolve_targets_new_shape_absolute_dir_needs_no_current_path(self, tmp_path):
+        targets = resolve_targets({"db": {"gis": {}}, "migrations": {"targets": {"gis": {"dir": str(tmp_path)}}}})
+
+        assert targets["gis"].directory == tmp_path
+
+    def test_resolve_targets_new_shape_relative_dir_without_current_path_raises(self):
+        with pytest.raises(MigrationError, match="current_path"):
+            resolve_targets({"db": {"gis": {}}, "migrations": {"targets": {"gis": {"dir": "sql/gis"}}}})
 
     def test_resolve_targets_unknown_db_raises(self, tmp_path):
         with pytest.raises(MigrationError, match="gis.*db"):
