@@ -5,6 +5,7 @@ import psycopg
 import pytest
 import pytest_asyncio
 
+from py_app_runner.migrations.discovery import MigrationError
 from py_app_runner.migrations.tracker import Tracker
 from tests.migrations_pg import dsn, pg_dsn_for
 
@@ -37,6 +38,48 @@ class TestEnsureTable:
         async with conn.cursor() as cur:
             await cur.execute("SELECT to_regclass('public.schema_history')")
             assert (await cur.fetchone())[0] == "schema_history"
+
+    async def test_refuses_to_adopt_an_unrelated_table_of_the_same_name(self, conn):
+        """`CREATE TABLE IF NOT EXISTS` matches on name only, and `migrations` is a generic
+        name. Adopting someone else's table silently made every later query die with a bare
+        `column "name" does not exist`, which points at nothing."""
+
+        async with conn.cursor() as cur:
+            await cur.execute("CREATE TABLE migrations (id serial primary key, version int)")
+
+        with pytest.raises(MigrationError) as excinfo:
+            await Tracker(conn).ensure_table()
+
+        message = str(excinfo.value)
+        assert "migrations" in message
+        assert "name" in message  # the missing column is named
+        assert "version" in message  # so is what was actually found
+        assert 'config["migrations"]["table"]' in message  # and the way out
+
+    async def test_a_table_with_extra_columns_is_still_accepted(self, conn):
+        """Only missing columns are a problem; an operator's own added column is not."""
+
+        tracker = Tracker(conn)
+        await tracker.ensure_table()
+        async with conn.cursor() as cur:
+            await cur.execute("ALTER TABLE migrations ADD COLUMN note TEXT")
+
+        await tracker.ensure_table()
+
+    async def test_a_same_named_table_in_another_schema_does_not_answer_for_it(self, conn):
+        """The column check resolves the schema from the oid search_path actually picks, so a
+        decoy `other.migrations` cannot vouch for a broken `public.migrations`."""
+
+        async with conn.cursor() as cur:
+            await cur.execute("CREATE SCHEMA other")
+            await cur.execute(
+                "CREATE TABLE other.migrations ("
+                "id int, name text, checksum text, applied_at timestamptz, duration_ms int, applied_by text)"
+            )
+            await cur.execute("CREATE TABLE public.migrations (id serial primary key, version int)")
+
+        with pytest.raises(MigrationError):
+            await Tracker(conn).ensure_table()
 
 
 class TestRows:
