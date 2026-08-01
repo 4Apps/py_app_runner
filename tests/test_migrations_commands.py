@@ -784,3 +784,136 @@ class TestServiceConfig:
                     "migrations": {"dir": "sql/steps", "targets": {"main": {}}},
                 }
             )
+
+
+def _db(database: str, hostname: str = "db.example.com", port: int | None = 5432) -> dict:
+    entry = {"hostname": hostname, "username": "app", "password": "s", "database": database}
+    if port is not None:
+        entry["port"] = port
+    return entry
+
+
+class TestSharedTrackingTableRefusal:
+    """Two targets may point at the same physical database - that is supported and one
+    consuming project depends on it - but they must not then share a tracking table, or each
+    reports the other's applied migrations as MISSING and `apply`'s printed remedy (DELETE
+    the tracking row) de-registers a migration that really did run."""
+
+    def test_same_db_key_and_default_tables_raises_naming_both_targets(self, tmp_path):
+        with pytest.raises(MigrationError) as excinfo:
+            resolve_targets(
+                {
+                    "current_path": str(tmp_path),
+                    "db": {"main": _db("appdb")},
+                    "migrations": {
+                        "targets": {
+                            "main": {"db": "main", "dir": "data/migrations"},
+                            "gis": {"db": "main", "dir": "data/migrations_gis"},
+                        }
+                    },
+                }
+            )
+
+        message = str(excinfo.value)
+        assert "'main'" in message
+        assert "'gis'" in message
+        assert "table" in message
+
+    def test_same_db_key_with_distinct_tables_resolves(self, tmp_path):
+        targets = resolve_targets(
+            {
+                "current_path": str(tmp_path),
+                "db": {"main": _db("appdb")},
+                "migrations": {
+                    "targets": {
+                        "main": {"db": "main", "dir": "data/migrations"},
+                        "gis": {"db": "main", "dir": "data/migrations_gis", "table": "gis_migrations"},
+                    }
+                },
+            }
+        )
+
+        assert list(targets) == ["main", "gis"]
+
+    def test_distinct_db_keys_resolving_to_the_same_database_raises(self, tmp_path):
+        # The dev-box case: two db keys, one physical postgres. The db key alone would look
+        # like two different databases, so the check must compare host/port/dbname.
+        with pytest.raises(MigrationError) as excinfo:
+            resolve_targets(
+                {
+                    "current_path": str(tmp_path),
+                    "db": {"main": _db("appdb"), "gis": _db("appdb")},
+                    "migrations": {
+                        "targets": {
+                            "main": {"db": "main", "dir": "data/migrations"},
+                            "gis": {"db": "gis", "dir": "data/migrations_gis"},
+                        }
+                    },
+                }
+            )
+
+        message = str(excinfo.value)
+        assert "'main'" in message
+        assert "'gis'" in message
+
+    def test_absent_port_matches_an_explicit_5432(self, tmp_path):
+        # connect_kwargs defaults a missing port to 5432, so the identity must too - or the
+        # same database written two ways slips past the check.
+        with pytest.raises(MigrationError):
+            resolve_targets(
+                {
+                    "current_path": str(tmp_path),
+                    "db": {"main": _db("appdb", port=None), "gis": _db("appdb", port=5432)},
+                    "migrations": {"targets": {"main": {}, "gis": {}}},
+                }
+            )
+
+    def test_same_table_in_genuinely_different_databases_resolves(self, tmp_path):
+        targets = resolve_targets(
+            {
+                "current_path": str(tmp_path),
+                "db": {"main": _db("appdb"), "gis": _db("gisdb")},
+                "migrations": {
+                    "targets": {
+                        "main": {"db": "main", "dir": "data/migrations"},
+                        "gis": {"db": "gis", "dir": "data/migrations_gis"},
+                    }
+                },
+            }
+        )
+
+        assert [target.table for target in targets.values()] == ["migrations", "migrations"]
+
+    def test_same_table_on_a_different_host_resolves(self, tmp_path):
+        targets = resolve_targets(
+            {
+                "current_path": str(tmp_path),
+                "db": {"main": _db("appdb"), "gis": _db("appdb", hostname="gis.example.com")},
+                "migrations": {"targets": {"main": {}, "gis": {}}},
+            }
+        )
+
+        assert list(targets) == ["main", "gis"]
+
+    def test_same_table_on_a_different_port_resolves(self, tmp_path):
+        targets = resolve_targets(
+            {
+                "current_path": str(tmp_path),
+                "db": {"main": _db("appdb"), "gis": _db("appdb", port=5433)},
+                "migrations": {"targets": {"main": {}, "gis": {}}},
+            }
+        )
+
+        assert list(targets) == ["main", "gis"]
+
+    def test_the_backward_compatible_shapes_never_trip_the_check(self, tmp_path):
+        # There is only ever one target on these paths, so the check has nothing to collide -
+        # but that is the whole compatibility promise, so assert it rather than assume it.
+        for config in (
+            {"current_path": str(tmp_path)},
+            {"current_path": str(tmp_path), "migrations": {}},
+            {"current_path": str(tmp_path), "migrations": {"dir": "sql/steps", "table": "migrations"}},
+            {"current_path": str(tmp_path), "db": {"main": _db("appdb")}, "migrations": {"targets": {"main": {}}}},
+        ):
+            targets = resolve_targets(config)
+            assert list(targets) == ["main"]

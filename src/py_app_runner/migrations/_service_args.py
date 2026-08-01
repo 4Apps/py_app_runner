@@ -37,7 +37,7 @@ def reg_subparsers(
 
     parser = subparsers.add_parser(
         "migrations",
-        description="Apply tracked SQL migrations to the main database",
+        description="Apply tracked SQL migrations to the configured database target(s)",
         help="Database migrations",
     )
     group = parser.add_subparsers(title="command", dest="step", required=True)

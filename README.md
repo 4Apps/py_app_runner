@@ -47,10 +47,16 @@ To migrate more than one database, opt in with `config["migrations"]["targets"]`
 Each target's `db` names a key under `config["db"]` and defaults to the target's own name;
 `dir` and `table` default as above. `status` and `apply` with no `--target` run every
 target in declared order (`apply` stops at the first one that fails; `status --check`
-checks all of them and exits 1 if any is pending or blocked). `new`, `repair` and
-`baseline` require `--target` once more than one target is configured, and an unknown
-`--target` exits 1 - both name the configured targets. Output gets a `[name] ` prefix only
-when more than one target is processed, so single-target output is unchanged.
+reports each target rather than stopping at the first with pending work, and exits 1 if any
+is pending or blocked). `new`, `repair` and `baseline` require `--target` once more than one
+target is configured, and an unknown `--target` exits 1 - both name the configured targets.
+Output gets a `[name] ` prefix only when more than one target is processed, so single-target
+output is unchanged.
+
+Targets may share a database, but not a database *and* a tracking table - each would then
+report the other's migrations as missing, so that config is refused up front, naming both
+targets. `table` defaults to `migrations` for every target, so two targets on one database
+need an explicit `table` on at least one of them.
 
 - Migrations no longer need to be idempotent - each file runs in its own transaction with
   its tracking row written inside it, so what already ran is always known.

@@ -4,6 +4,7 @@ subparser registers on a real ArgumentParser without colliding with the top-leve
 database when driven the way `runner.py` drives it."""
 
 import argparse
+import asyncio
 import logging
 import os
 import pathlib
@@ -318,6 +319,49 @@ class TestProcessExitCodes:
 
             assert excinfo.value.code == 1
 
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
+    async def test_an_interrupt_mid_run_exits_one_and_logs(
+        self, tmp_path, saved_registry, monkeypatch, caplog, interrupt
+    ):
+        """`KeyboardInterrupt` and `CancelledError` derive from `BaseException`, so
+        `except Exception` never saw them: they reached runner.py, which swallows them with a
+        bare `...` and returns - exit 0, with no log line at all. `apply` runs one file at a
+        time, so a Ctrl-C between two files left a partially migrated database reported as a
+        success."""
+
+        migrations_dir = tmp_path / "data" / "migrations"
+        migrations_dir.mkdir(parents=True)
+
+        db_name = "par_test_service_interrupt"
+        async with pg_dsn_for(db_name):
+            config = {
+                "current_path": str(tmp_path),
+                "db": {
+                    "main": {
+                        "hostname": PG_HOST,
+                        "port": PG_PORT,
+                        "username": PG_USER,
+                        "password": PG_PASSWORD,
+                        "database": db_name,
+                    }
+                },
+            }
+            AppRegistry.configure(config=config, users_model=object, api_keys_model=object)
+
+            async def interrupted(*_args, **_kwargs):
+                raise interrupt()
+
+            monkeypatch.setattr("py_app_runner.migrations._service.cmd_apply", interrupted)
+
+            with caplog.at_level(logging.ERROR, logger="test"):
+                with pytest.raises(SystemExit) as excinfo:
+                    await init_service(
+                        Namespace(step="apply", dry_run=False, to=None), None, logging.getLogger("test")
+                    )
+
+            assert excinfo.value.code == 1
+            assert any("interrupted" in record.message for record in caplog.records)
+
     async def test_a_misconfigured_targets_block_exits_one_rather_than_zero(self, tmp_path, saved_registry):
         """The same bug as the two cases above, one layer up: `resolve_targets` and
         `_select_targets` used to run outside the `try`, so a `MigrationError` from a typo'd
@@ -438,8 +482,9 @@ class TestMultiTargetDispatch:
     all dispatch the way the plan requires."""
 
     async def test_single_target_output_has_no_prefix(self, tmp_path, saved_registry, capsys):
-        """Backward compatibility: with exactly one target configured, output must stay
-        byte-identical to before this task - no `[main] ` noise."""
+        """Backward compatibility: with exactly one target configured, `apply` output carries
+        no `[main] ` prefix and still reports the applied file. This asserts prefix-absence on
+        one command - not byte-identity of every command's output against pre-targets."""
 
         migrations_dir = tmp_path / "data" / "migrations"
         migrations_dir.mkdir(parents=True)
@@ -662,7 +707,10 @@ class TestMultiTargetDispatch:
                     "hostname": "no-such-host-at-all.invalid",
                     "username": "x",
                     "password": "x",
-                    "database": "x",
+                    # A different database from alpha's: two targets sharing one database
+                    # AND one tracking table is refused at resolution, which would refuse
+                    # this config before it ever reached the --target check under test.
+                    "database": "y",
                 },
             },
             "migrations": {"targets": {"alpha": {}, "beta": {}}},
@@ -694,7 +742,10 @@ class TestMultiTargetDispatch:
                     "hostname": "no-such-host-at-all.invalid",
                     "username": "x",
                     "password": "x",
-                    "database": "x",
+                    # A different database from alpha's: two targets sharing one database
+                    # AND one tracking table is refused at resolution, which would refuse
+                    # this config before it ever reached the --target check under test.
+                    "database": "y",
                 },
             },
             "migrations": {"targets": {"alpha": {}, "beta": {}}},
@@ -726,7 +777,10 @@ class TestMultiTargetDispatch:
                     "hostname": "no-such-host-at-all.invalid",
                     "username": "x",
                     "password": "x",
-                    "database": "x",
+                    # A different database from alpha's: two targets sharing one database
+                    # AND one tracking table is refused at resolution, which would refuse
+                    # this config before it ever reached the --target check under test.
+                    "database": "y",
                 },
             },
             "migrations": {"targets": {"alpha": {}, "beta": {}}},

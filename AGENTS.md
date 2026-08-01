@@ -108,17 +108,28 @@ Each entry's `db` names a key under `config["db"]` and defaults to the target's 
 
 - `status` and `apply` with no `--target` run every target, in declared order. `apply`
   stops at the first target that fails, so a broken first target never leaves you
-  half-migrated across two databases; `status --check` checks all of them before exiting,
-  and exits 1 if any has pending or blocked work.
+  half-migrated across two databases; `status --check` does not stop at the first target
+  with pending work - it reports each one and exits 1 if any had pending or blocked work.
+  (An *exception* - an unreachable database - still aborts the loop, so later targets go
+  unreported; the exit code is 1 either way.)
 - `new`, `repair` and `baseline` need `--target` once more than one target is configured,
   and refuse otherwise, naming the configured targets - guessing is not acceptable here
   because a mis-stamped `baseline` produces a permanently green `status` over a database
   that never got its tables. With exactly one target (the default case) they need no flag.
 - An unknown `--target` exits 1 naming the configured targets.
-- Each target gets its own connection and its own advisory lock, and targets are processed
-  strictly in sequence, never concurrently - two targets may legitimately point at the same
-  physical database, and concurrent processing would make the shared advisory lock contend
-  with itself.
+- Each target gets its own connection and takes the same fixed advisory lock on it, and
+  targets are processed strictly in sequence, never concurrently - two targets may
+  legitimately point at the same physical database, and concurrent processing would make
+  that one lock contend with itself.
+- Two targets resolving to the same physical database (same host/port/dbname, whether via
+  one `db` key or two that happen to point at the same place) **must not share a tracking
+  table**, and `resolve_targets` refuses such a config naming both targets. Each would
+  otherwise see the other's rows with no matching file and report `MISSING`, and the
+  remedy `apply` prints for `MISSING` is a `DELETE` of the tracking row - which
+  de-registers a migration that really did run and re-runs it on the next `apply`.
+  Sharing a database is supported; sharing a database and a table is the error. Since
+  `table` defaults to `migrations` for every target, two targets on one database need an
+  explicit `table` on at least one of them.
 - Output gets a `[name] ` prefix only when more than one target is being processed;
   single-target output is unchanged from before targets existed.
 
@@ -155,8 +166,8 @@ Each entry's `db` names a key under `config["db"]` and defaults to the target's 
   with a bare `column "name" does not exist`.
 - Files must not contain psql meta-commands. `pg_dump` emits `\restrict` / `\unrestrict`,
   and psycopg has no psql to interpret them - `apply` refuses such a file up front.
-- `apply` holds a session advisory lock for the whole run, so two containers starting at
-  once serialise instead of racing.
+- `apply` holds a session advisory lock for the whole of each target's run (it is taken and
+  released per target), so two containers starting at once serialise instead of racing.
 - `baseline` is how an existing database adopts the system: it writes tracking rows without
   executing anything.
 - `status --check` exits 1 if anything is pending or drifted/missing, so a deploy script
@@ -166,8 +177,11 @@ Each entry's `db` names a key under `config["db"]` and defaults to the target's 
   `Exception` around `init_service` and returns normally, which would exit 0 - deliberate
   for a long-running service, fatal here - so `migrations/_service.py` converts any
   non-`SystemExit` failure (unreachable database, permissions error, dropped connection,
-  or a misconfigured `targets` block) into `SystemExit(1)` itself. Do not "simplify" that
-  away.
+  or a misconfigured `targets` block) into `SystemExit(1)` itself. `KeyboardInterrupt` and
+  `asyncio.CancelledError` are caught separately, ahead of that clause - they derive from
+  `BaseException`, so `except Exception` never sees them, and an interrupt between two
+  migration files would otherwise report success over a partially migrated database. Do
+  not "simplify" either clause away.
 - `commands.py` is importable directly for programmatic use (for example, building a
   throwaway database in a test harness). `cmd_apply`, `cmd_baseline` and `cmd_repair`
   require an autocommit connection and refuse otherwise, since each opens and closes its

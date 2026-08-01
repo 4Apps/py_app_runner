@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import pathlib
 import socket
@@ -67,6 +68,41 @@ def _resolve_directory(raw_dir: str | None, config: dict[str, Any]) -> pathlib.P
     return pathlib.Path(current_path) / directory
 
 
+def _database_identity(db_config: dict[str, Any]) -> tuple[Any, Any, Any]:
+    """The physical database a `config["db"]` entry points at.
+
+    Two different db keys can name the same host/port/dbname - a dev box collapsing "main"
+    and "gis" onto one postgres database is the documented case - so the tracking-table
+    collision check below has to compare on this, not on the db key. The port default
+    mirrors connect_kwargs, so both agree on what an absent port means.
+    """
+
+    return (db_config.get("hostname"), db_config.get("port") or 5432, db_config.get("database"))
+
+
+def _reject_shared_tracking_tables(targets: dict[str, Target], db_config: dict[str, Any]) -> None:
+    """Two targets sharing a database is legal and supported; sharing a database *and* a
+    tracking table is not. They would each read the other's rows, see no matching file and
+    report MISSING - and the remediation `apply` prints for MISSING is a DELETE of the
+    tracking row, which de-registers a genuinely applied migration and re-runs it on the
+    next apply. Migrations are explicitly allowed to be non-idempotent, so that is a
+    data-corruption path reached by following the tool's own advice."""
+
+    seen: dict[tuple[Any, Any, Any, str], str] = {}
+    for target in targets.values():
+        identity = (*_database_identity(db_config[target.db]), target.table)
+        clash = seen.get(identity)
+        if clash is not None:
+            raise MigrationError(
+                f"migrations targets {clash!r} and {target.name!r} resolve to the same physical "
+                f"database and both track in table {target.table!r}; each would report the other's "
+                f'migrations as MISSING. Give at least one of them its own "table" under '
+                f'config["migrations"]["targets"]. Sharing a database is fine - sharing a database '
+                f"and a tracking table is not."
+            )
+        seen[identity] = target.name
+
+
 def resolve_targets(config: dict[str, Any]) -> dict[str, Target]:
     """Resolve `config["migrations"]` into an ordered mapping of target name -> Target.
 
@@ -111,6 +147,7 @@ def resolve_targets(config: dict[str, Any]) -> dict[str, Target]:
                 table=entry.get("table") or _DEFAULT_TABLE,
             )
 
+        _reject_shared_tracking_tables(targets, db_config)
         return targets
 
     directory = _resolve_directory(settings.get("dir"), config)
@@ -244,6 +281,14 @@ async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Log
             else:
                 code = target_code
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Both derive from BaseException, so the `except Exception` below never sees them:
+        # they would sail past init_service into runner.py, which swallows them and returns -
+        # exit 0, with no log line at all. `apply` runs one file at a time, so an interrupt
+        # between two files leaves a partially migrated database while telling the playbook
+        # it succeeded. Must stay above the `except Exception` clause to take effect.
+        logger.error("migrations: interrupted; the database may be partially migrated")
+        raise SystemExit(1) from None
     except Exception:
         logger.exception("migrations: unhandled failure")
         raise SystemExit(1) from None
