@@ -38,8 +38,23 @@ count, appended by CI at build time.
 - `py_app_runner.__version__` resolves from installed package metadata, so it always
   matches the wheel that was actually installed.
 
+## CI
+
+Two workflows, both on the self-hosted runner:
+
+- `.github/workflows/test.yml` — runs on every push to master and on pull requests.
+  Builds the development image and runs `code_tests.bash`. Publishes nothing.
+- `.github/workflows/publish.yml` — **`workflow_dispatch` only.** Re-runs the tests,
+  builds the wheel, then publishes it. Trigger it from the Actions tab or with
+  `gh workflow run publish.yml [--ref <branch>]`.
+
+Publishing is manual on purpose: a wheel on the server is permanent and moves the
+`-latest` symlink, so a docs-only commit should not mint one. The patch part of the
+version is the commit count, so skipped commits simply leave gaps in the sequence -
+that is harmless, versions stay unique and monotonic.
+
 Publishing: the runner is on processing, so the workflow scp's the wheel to
-`services@4apps.lv:/srv/sites/4apps.lv/www/Application/Public/apps/py/` and repoints the
+`services@4apps.lv:/srv/services/4apps-www/public/apps/py/` and repoints the
 `py_app_runner-latest-py3-none-any.whl` symlink at it. Downstream projects pin an exact
 versioned wheel URL, so publishing never changes what an existing project resolves.
 

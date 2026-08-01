@@ -1,13 +1,13 @@
 name: Build & Publish
 
+# Manual only. Pushes to master are tested by test.yml; cutting a wheel is a
+# deliberate act because the artifact is permanent and downstream projects pin it.
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build & Test
+    name: Build & Publish
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v5
@@ -44,7 +44,7 @@ jobs:
       - name: Publish wheel
         env:
           PUBLISH_HOST: services@4apps.lv
-          PUBLISH_DIR: /srv/sites/4apps.lv/www/Application/Public/apps/py
+          PUBLISH_DIR: /srv/services/4apps-www/public/apps/py
         run: |
           NAME="py_app_runner-${VERSION}-py3-none-any.whl"
           scp -o BatchMode=yes "dist/$NAME" "$PUBLISH_HOST:$PUBLISH_DIR/$NAME"

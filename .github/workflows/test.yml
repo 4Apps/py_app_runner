@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create docker external network
+        run: docker network create py_app_runner_network || true
+
+      - name: Pull latest base image
+        run: docker pull debian:trixie-slim
+
+      - name: Build development image
+        run: docker compose build develop
+
+      - name: Run code tests
+        run: docker compose run --rm develop /srv/meta/scripts/code_tests.bash
