@@ -46,8 +46,8 @@ The old `4apps.lv` wheel server is retired - move pins to `py_app_runner==<versi
 
 ### CI
 
-- `test.yml` — pushes to `master`/`develop`, all PRs, `workflow_call`. Self-hosted runner (needs
-  the containers). Both publish workflows call it.
+- `test.yml` — pushes to `master`, all PRs, `workflow_call`. Self-hosted runner (needs the
+  containers). Both publish workflows call it.
 - `publish-dev.yml` — every push to `develop` except markdown and `specs/`. `skip-existing` on,
   concurrency queues rather than cancels.
 - `publish.yml` — **`release: published` only**, no `skip-existing`. Refuses a tag that

@@ -1,13 +1,23 @@
 name: Tests
 
 on:
+  # Deliberately not develop: publish-dev.yml already calls this workflow on every develop
+  # push, and listing it here too would start the suite twice for one push
   push:
-    branches: [master, develop]
+    branches: [master]
   pull_request:
   workflow_dispatch:
   # Both publish workflows call this rather than repeating the docker steps, so a release
-  # can never be built from a tree the suite has not run against
+  # can never be built from a tree the suite has not run against. workflow_call reuses the
+  # definition, not the result - the suite genuinely runs again against the tagged tree.
   workflow_call:
+
+# docker-compose.yml pins container_name, so every run of this workflow wants the same
+# py_app_runner_database and py_app_runner_cache. One global group, never cancelled: two
+# suites sharing one Postgres would drop each other's tables mid-run.
+concurrency:
+  group: py-app-runner-docker-rig
+  cancel-in-progress: false
 
 jobs:
   test:
