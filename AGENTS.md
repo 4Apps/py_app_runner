@@ -46,8 +46,9 @@ The old `4apps.lv` wheel server is retired - move pins to `py_app_runner==<versi
 
 ### CI
 
-- `test.yml` — pushes to `master`, all PRs, `workflow_call`. Self-hosted runner (needs the
-  containers). Both publish workflows call it.
+- `test.yml` — pushes to `master`, all PRs, `workflow_call`. Both publish workflows call it;
+  `workflow_call` reuses the definition, not the result, so a release re-runs the suite
+  against the tagged tree. Not `develop` - `publish-dev.yml` already calls it there.
 - `publish-dev.yml` — every push to `develop` except markdown and `specs/`. `skip-existing` on,
   concurrency queues rather than cancels.
 - `publish.yml` — **`release: published` only**, no `skip-existing`. Refuses a tag that
@@ -58,6 +59,15 @@ scripts/release_tag.bash          # creates v0.4.52 locally
 git push origin v0.4.52           # publishes nothing
 gh release create v0.4.52 --title v0.4.52 --generate-notes   # point of no return
 ```
+
+All three run on `ubuntu-latest`. The repository is public, and GitHub's org runner groups
+refuse public repositories by default - a bare `pull_request` trigger on a self-hosted
+runner lets a fork's PR execute code on an internal machine. Hosted runners are free for
+public repositories and each job gets a disposable VM, at the cost of no layer cache.
+`test.yml` derives `LOCAL_USER_ID`/`LOCAL_GROUP_ID` from the runner user. `.env` supplies
+them locally and is gitignored, so CI would otherwise fall back to the Dockerfile's default
+of 1000 while the runner user is 1001, leaving `appuser` unable to write into the
+bind-mounted workspace.
 
 Both publish jobs use trusted publishing (OIDC, `id-token: write`); no PyPI token is stored.
 Publisher identity is owner + repo + workflow *filename* + environment - `publish.yml` in
