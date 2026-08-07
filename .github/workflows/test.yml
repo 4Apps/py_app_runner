@@ -2,9 +2,12 @@ name: Tests
 
 on:
   push:
-    branches: [master]
+    branches: [master, develop]
   pull_request:
   workflow_dispatch:
+  # Both publish workflows call this rather than repeating the docker steps, so a release
+  # can never be built from a tree the suite has not run against
+  workflow_call:
 
 jobs:
   test:

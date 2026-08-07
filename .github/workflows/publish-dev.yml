@@ -1,0 +1,80 @@
+name: Publish dev
+
+# Every push to develop mints a pre-release. This is the PyPI stand-in for Packagist's
+# dev-develop: PyPI has no mutable branch pointer, so "the tip of develop" has to be a
+# distinct immutable version per commit.
+#
+# Markdown and spec commits are filtered out. They cannot change what the wheel contains,
+# and a version on PyPI is permanent - a typo fix in AGENTS.md should not leave one behind.
+on:
+  push:
+    branches: [develop]
+    paths-ignore:
+      - '**.md'
+      - 'specs/**'
+  workflow_dispatch:
+
+# Uploads are queued rather than cancelled: interrupting one half way is worse than waiting
+concurrency:
+  group: publish-dev
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Tests
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    name: Build & Publish dev to PyPI
+    needs: [test]
+    runs-on: ubuntu-latest
+    environment: release-dev
+    permissions:
+      # Mandatory for trusted publishing; no API token is stored anywhere
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # scripts/version.bash derives the patch from the commit count, so it needs the
+          # full history - a shallow clone would silently produce version .1
+          fetch-depth: 0
+
+      - name: Resolve dev version
+        run: |
+          VERSION="$(scripts/version.bash --dev)"
+          echo "$VERSION" > .version
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Publishing py_app_runner $VERSION"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install build tooling
+        run: python -m pip install -U build twine
+
+      - name: Build sdist and wheel
+        run: |
+          rm -rf dist
+          python -m build
+
+      # An unreadable or empty .version makes setuptools fall back to 0.0.0 rather than
+      # fail, and 0.0.0 on PyPI could never be withdrawn. Assert the filename rather than
+      # trusting that the rewrite above landed.
+      - name: Verify built version
+        run: |
+          if [ ! -f "dist/py_app_runner-${VERSION}-py3-none-any.whl" ]; then
+            echo "::error::expected dist/py_app_runner-${VERSION}-py3-none-any.whl, built:" >&2
+            ls -1 dist >&2
+            exit 1
+          fi
+
+      - name: Check distributions
+        run: twine check --strict dist/*
+
+      # skip-existing because the commit count does not move on a re-run or a forced push
+      # that lands the same history; that is not worth failing a dev build over
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

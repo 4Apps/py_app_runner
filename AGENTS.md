@@ -1,66 +1,69 @@
 # py_app_runner
 
-Async Python service framework providing Tornado HTTP/WS bridge, dynamic service loader (PyBridge), and Redis-backed WebSocket connection manager. Used as a library dependency by 4Apps backend projects.
+Async Python service framework: Tornado HTTP/WS bridge, dynamic service loader (PyBridge),
+Redis-backed WebSocket connection manager. Used as a library by 4Apps backend projects.
 
 ## Build & Run
 
 ```bash
-# Development (Docker)
-docker compose up develop
+docker compose up develop          # Postgres (main_db) + Redis (cache_db) + dev container
 docker compose exec develop bash
 
-# Install as dependency in another project
-pip install git+ssh://git@github.com/4Apps/py_app_runner.git
+pip install py_app_runner          # as a dependency elsewhere
+pip install --pre py_app_runner    # include develop-branch pre-releases
 
-# Run tests inside container
-/srv/meta/scripts/code_tests.bash
-
-# Lint
-ruff check src/
-ruff format src/
-
-# Type check
+/srv/meta/scripts/code_tests.bash  # tests, inside the container
+ruff check src/ && ruff format src/
 pyrefly check ./src/
 ```
 
-## Versioning
+Postgres and Redis are test dependencies, not runtime ones. An unreachable server is a test
+**failure**, not a skip; `ALLOW_PG_SKIP` / `ALLOW_REDIS_SKIP` opt into skipping on a bare checkout.
 
-`major.minor` is manual and lives in `.version`; the patch part is the git commit
-count, appended by CI at build time.
+## Versioning & Release
 
-- `.version` — the only place the version is declared. `pyproject.toml` reads it via
-  `[tool.setuptools.dynamic]`, so a local build reports plain `major.minor`.
-- `.github/workflows/publish.yml` rewrites `.version` to `<major.minor>.<git rev-list --count HEAD>`
-  before building, which stamps the wheel filename and package metadata. The rewrite is
-  workspace-only, never committed. Checkout needs `fetch-depth: 0` or the count is wrong.
-- `scripts/bump_version.bash [major|minor]` — bumps and stages `.version`. Nothing bumps
-  the patch part by hand.
-- `py_app_runner.__version__` resolves from installed package metadata, so it always
-  matches the wheel that was actually installed.
+`major.minor` is manual in `.version` (read by `pyproject.toml` via
+`[tool.setuptools.dynamic]`); the patch part is the git commit count, appended by CI.
 
-## CI
+- `scripts/version.bash` — prints `<major.minor>.<git rev-list --count HEAD>`; `--dev` appends
+  `.dev0`. Publish workflows write it into `.version` before building, workspace-only. Needs
+  `fetch-depth: 0`; refuses a shallow clone.
+- `scripts/bump_version.bash [major|minor]` — bumps and stages `.version`. Never bump the patch by hand.
+- `scripts/release_tag.bash` — creates `v<version>`, publishes nothing; refuses a tag sorting
+  below the newest existing one (remedy: bump the minor).
+- `py_app_runner.__version__` comes from installed package metadata.
 
-Two workflows, both on the self-hosted runner:
+**A PyPI version can never be replaced or re-uploaded**, and a rebase/squash/reset shortens
+history into an already-published version. For that reason, **merge develop into master with
+`--no-ff`**. Skipped commits leave harmless gaps in the sequence.
 
-- `.github/workflows/test.yml` — runs on every push to master and on pull requests.
-  Builds the development image and runs `code_tests.bash`. Publishes nothing.
-- `.github/workflows/publish.yml` — **`workflow_dispatch` only.** Re-runs the tests,
-  builds the wheel, then publishes it. Trigger it from the Actions tab or with
-  `gh workflow run publish.yml [--ref <branch>]`.
+| Trigger | Version | pip resolves it |
+| --- | --- | --- |
+| push to `develop` | `0.4.50.dev0` | only with `--pre`, or an exact pin |
+| GitHub release on `v0.4.52` | `0.4.52` | as "latest" |
 
-Publishing is manual on purpose: a wheel on the server is permanent and moves the
-`-latest` symlink, so a docs-only commit should not mint one. The patch part of the
-version is the commit count, so skipped commits simply leave gaps in the sequence -
-that is harmless, versions stay unique and monotonic.
+The old `4apps.lv` wheel server is retired - move pins to `py_app_runner==<version>`.
 
-Publishing: the runner is on processing, so the workflow scp's the wheel to
-`services@4apps.lv:/srv/services/4apps-www/public/apps/py/` and repoints the
-`py_app_runner-latest-py3-none-any.whl` symlink at it. Downstream projects pin an exact
-versioned wheel URL, so publishing never changes what an existing project resolves.
+### CI
+
+- `test.yml` — pushes to `master`/`develop`, all PRs, `workflow_call`. Self-hosted runner (needs
+  the containers). Both publish workflows call it.
+- `publish-dev.yml` — every push to `develop` except markdown and `specs/`. `skip-existing` on,
+  concurrency queues rather than cancels.
+- `publish.yml` — **`release: published` only**, no `skip-existing`. Refuses a tag that
+  disagrees with the derived version, and refuses a GitHub pre-release.
+
+```bash
+scripts/release_tag.bash          # creates v0.4.52 locally
+git push origin v0.4.52           # publishes nothing
+gh release create v0.4.52 --title v0.4.52 --generate-notes   # point of no return
+```
+
+Both publish jobs use trusted publishing (OIDC, `id-token: write`); no PyPI token is stored.
+Publisher identity is owner + repo + workflow *filename* + environment - `publish.yml` in
+`release`, `publish-dev.yml` in `release-dev`. **Renaming either file breaks publishing.**
 
 ## Architecture
-
-### Request Flow
 
 ```
 Client (HTTP or WS)
@@ -71,21 +74,34 @@ Client (HTTP or WS)
   → response dict → write_custom_message() wraps in {"data": ...} → encoded → sent
 ```
 
-### Core Components
+- **`runner.py`** — CLI entrypoint (`main()`): args, logging/Sentry, service loading, event loop (uvloop in prod).
+- **`pybridge.py`** — Dynamic loader. `services.<name>._service` / `_service_args` /
+  `_service_pybridge`, falling back to `py_app_runner.<name>.<module>` for built-ins (`bridge`,
+  `migrations`). Project services win, so a project can override a built-in by name.
+- **`registry.py`** — `AppRegistry` singleton (config, models, Redis channel, web app class). Configure before start.
+- **`config.py`** — `load_config()` maps `ENV_VAR` names into nested dict keys by splitting on
+  `_`; only vars whose first key exists in defaults are processed. `is_env_dev/test/prod`.
+- **`db_pools.py`** — PostgreSQL + Redis pool management.
+- **`bridge/`** — `web_app.py` (Tornado app), `api.py` (`ApiHandler`), `websocket.py`
+  (`BaseWebSocketHandler`: lifecycle, token cache, heartbeat), `encoders/` (msgspec JSON /
+  MessagePack, chosen by a class attribute), `_service.py` (startup; forks workers in prod,
+  single-process autoreload in dev).
+- **`request_handler/`** — `handlers.py` has two distinct bases: `RequestHandlerBase` /
+  `WebHandlerBase` are the real Tornado handlers carrying request context (the `bridge_handler`);
+  `RequestHandlerHelper` is a plain class for action dispatch and is what services extend. Also
+  `decorators.py`, `auth_service.py` (JWT: user, device, impersonation), `pagination.py`
+  (`parse_pagination()`).
+- **`wbcm/`** — Redis pub/sub relay across instances. `wb_connection_manager.py` (background
+  thread, routes via `call_soon_threadsafe`), `factory.py` (`UserConnections`),
+  `device_connections.py` (`DeviceConnections`), `ws_interface.py` (`WebSocketHandlerInterface` ABC).
+- **`http_exception.py`** (`HTTPException.to_dict()`), **`return_model.py`**
+  (`StatusModel`/`MessageModel`/`ReturnModel`),
+  **`tick_service.py`** (periodic base with graceful shutdown), **`timer.py`**, **`utils.py`**
+  (`json_encode/decode`, `sha256_hash`, `generate_random_string`).
 
-- **`runner.py`** — CLI entrypoint (`main()`). Parses args, sets up logging/Sentry, loads services via PyBridge, starts the async event loop (uvloop in prod).
-- **`pybridge.py`** — Dynamic service loader. Imports service modules from
-  `services.<name>._service` / `_service_args` / `_service_pybridge`, falling back to
-  `py_app_runner.<name>.<module>` for built-ins (`bridge`, `migrations`). Project services
-  win, so a project can override a built-in by shipping its own module of the same name.
-- **`registry.py`** — `AppRegistry` singleton. Holds project-specific config, model classes, Redis channel, and web app class. Must be configured before runner starts.
-- **`config.py`** — `load_config()` loads `.env`, maps `ENV_VAR` names into nested dict keys by splitting on `_`. Only vars whose first key exists in defaults are processed. Helpers: `is_env_dev/test/prod`.
-- **`db_pools.py`** — Database connection pool management (PostgreSQL + Redis).
+## Migrations (`migrations/`)
 
-### Migrations (`migrations/`)
-
-Built-in service that applies tracked SQL files to one or more configured databases.
-Enabled by adding `migrations` to `SERVICES`; omit it and nothing is imported.
+Applies tracked SQL files to one or more databases. Add `migrations` to `SERVICES` to enable.
 
 ```
 python3 src/app.py migrations status   [--check] [--target NAME]
@@ -95,146 +111,182 @@ python3 src/app.py migrations new      <name> [--target NAME]
 python3 src/app.py migrations repair   <filename> [--target NAME]
 ```
 
-By default there is exactly one target, named `main`, against `config["db"]["main"]`.
-Files live in `config["migrations"]["dir"]` (default `data/migrations`, relative to
-`current_path`) and are named `YYYY-MM-DD-HHMMSS-kebab-name.sql`. The timestamp prefix both
-orders them and keeps two feature branches from colliding the way sequential numbers do.
-The tracking table is `config["migrations"]["table"]` (default `migrations`) - override it
-when that name is already taken by something else in the database. **This is the shape
-every project ships today and it needs no config change** - an absent `migrations` key, an
-empty one, and this flat `{"dir", "table"}` shape all resolve to that same single `main`
-target.
+Default is one target `main` on `config["db"]["main"]`, files `YYYY-MM-DD-HHMMSS-kebab-name.sql`
+in `config["migrations"]["dir"]` (`data/migrations`, relative to `current_path`), tracked in
+`config["migrations"]["table"]` (`migrations`). An absent key, an empty one, and the flat
+`{"dir", "table"}` shape all mean that single target - **no project needs a config change.**
 
-A project that needs to migrate a second database (for example a GIS database alongside
-the main one) opts in with `config["migrations"]["targets"]`:
+A second database opts in with `targets`; `db` defaults to the target name, `dir`/`table` as above.
+Mixing `targets` with a top-level `dir`/`table` is rejected.
 
 ```python
-"migrations": {
-    "targets": {
-        "main": {"db": "main", "dir": "data/migrations", "table": "migrations"},
-        "gis": {"db": "gis", "dir": "data/migrations_gis", "table": "gis_migrations"},
-    }
-}
+"migrations": {"targets": {
+    "main": {"db": "main", "dir": "data/migrations", "table": "migrations"},
+    "gis":  {"db": "gis", "dir": "data/migrations_gis", "table": "gis_migrations"},
+}}
 ```
 
-Each entry's `db` names a key under `config["db"]` and defaults to the target's own name;
-`dir` and `table` default the same way as the flat shape. Mixing `targets` with a top-level
-`dir`/`table` is rejected as a config mistake rather than merged. With `targets` present:
+- No `--target`: `status`/`apply` run every target in order; `apply` stops at the first failure,
+  `status --check` reports all and exits 1 if any is pending/blocked. Output is `[name] `-prefixed
+  only when processing more than one.
+- `new`/`repair`/`baseline` require `--target` once more than one exists. Unknown target exits 1.
+- Targets run strictly in sequence, each taking the same advisory lock on its own connection.
+- Two targets on one physical database **must not share a tracking table** - refused by
+  `resolve_targets`, since each would see the other's rows as `MISSING`.
+- Each file runs in its own transaction, tracking row written inside it. Migrations need not be idempotent.
+- `-- migrations:no-transaction` on line 1 (for `CREATE INDEX CONCURRENTLY`) requires **exactly
+  one statement** - Postgres wraps multi-statement sends in an implicit transaction. `apply`
+  refuses at pre-flight (crude count: strip `--`, split on `;`). A failed one is not recorded and
+  may have partially applied.
+- `DRIFT` (sha256 mismatch) and `MISSING` (tracked file deleted) block `apply`. `repair` fixes
+  DRIFT only; MISSING needs the file restored, or `DELETE FROM migrations WHERE name = '<name>';`
+  which `apply` prints.
+- Refused up front: psql meta-commands (`pg_dump`'s `\restrict`), and an unrelated pre-existing
+  `migrations` table (created `IF NOT EXISTS`, then column-checked).
+- `baseline` writes tracking rows without executing anything.
+- Every subcommand exits non-zero on failure. `runner.py` would exit 0, so `_service.py` converts
+  non-`SystemExit` failures to `SystemExit(1)` and catches `KeyboardInterrupt` /
+  `CancelledError` separately ahead of it. **Do not simplify either clause away.**
+- `commands.py` is importable; `cmd_apply`/`cmd_baseline`/`cmd_repair` require autocommit.
 
-- `status` and `apply` with no `--target` run every target, in declared order. `apply`
-  stops at the first target that fails, so a broken first target never leaves you
-  half-migrated across two databases; `status --check` does not stop at the first target
-  with pending work - it reports each one and exits 1 if any had pending or blocked work.
-  (An *exception* - an unreachable database - still aborts the loop, so later targets go
-  unreported; the exit code is 1 either way.)
-- `new`, `repair` and `baseline` need `--target` once more than one target is configured,
-  and refuse otherwise, naming the configured targets - guessing is not acceptable here
-  because a mis-stamped `baseline` produces a permanently green `status` over a database
-  that never got its tables. With exactly one target (the default case) they need no flag.
-- An unknown `--target` exits 1 naming the configured targets.
-- Each target gets its own connection and takes the same fixed advisory lock on it, and
-  targets are processed strictly in sequence, never concurrently - two targets may
-  legitimately point at the same physical database, and concurrent processing would make
-  that one lock contend with itself.
-- Two targets resolving to the same physical database (same host/port/dbname, whether via
-  one `db` key or two that happen to point at the same place) **must not share a tracking
-  table**, and `resolve_targets` refuses such a config naming both targets. Each would
-  otherwise see the other's rows with no matching file and report `MISSING`, and the
-  remedy `apply` prints for `MISSING` is a `DELETE` of the tracking row - which
-  de-registers a migration that really did run and re-runs it on the next `apply`.
-  Sharing a database is supported; sharing a database and a table is the error. Since
-  `table` defaults to `migrations` for every target, two targets on one database need an
-  explicit `table` on at least one of them.
-- Output gets a `[name] ` prefix only when more than one target is being processed;
-  single-target output is unchanged from before targets existed.
+## Field Encryption (`crypto/`)
 
-- Each file runs in its own transaction, with its tracking row written inside that same
-  transaction - a migration either fully lands and is recorded, or neither. Put
-  `-- migrations:no-transaction` on line 1 for `CREATE INDEX CONCURRENTLY` and friends.
-- **A no-transaction file must contain exactly one statement.** Postgres wraps a
-  multi-statement simple-Query send in an *implicit* transaction, so the directive would
-  silently not take effect; the whole file goes to `cur.execute()` in one call and there is
-  no statement splitter. `apply` counts statements during its pre-flight scan and refuses
-  such a file before executing anything. The count is crude (strip `--` comments, split on
-  `;`), so it over-counts a dollar-quoted body - acceptable, since that is a loud refusal at
-  scan time and no dollar-quoted function body needs this directive.
-- A **failed** no-transaction file cannot roll back and is not recorded. `apply` says so
-  explicitly: it may have partially applied (a failed `CREATE INDEX CONCURRENTLY` leaves an
-  invalid index behind, and a re-run then dies on `relation already exists`), so inspect the
-  database before re-running.
-- Because what ran is recorded, **migrations do not need to be idempotent**.
-- A sha256 of each file is stored; editing an applied file shows as `DRIFT` and blocks
-  `apply` until it is reverted or `repair`ed. A tracked migration whose file has since been
-  deleted (a rebase, a squash, someone pruning old files) shows as `MISSING` and blocks
-  `apply` the same way - the database claims to have run something the repository can no
-  longer show, so nobody can tell whether the schema still matches.
-- `repair` is the DRIFT remedy only; it re-reads the file to re-stamp its checksum, so for
-  `MISSING` it can only answer "no such migration file". The remedies for `MISSING` are to
-  restore the file from version control, or - if it is gone for good and its schema change
-  is known to be in place - to delete the tracking row by hand:
-  `DELETE FROM migrations WHERE name = '<name>';`. `apply` prints that statement, with the
-  configured table name filled in, when it blocks on a `MISSING` state.
-- The tracking table is created with `CREATE TABLE IF NOT EXISTS`, which matches on name
-  alone. Its columns are verified straight afterwards, so an unrelated pre-existing
-  `migrations` table is reported as such - naming the missing columns and pointing at the
-  `config["migrations"]["table"]` override - rather than being adopted and failing later
-  with a bare `column "name" does not exist`.
-- Files must not contain psql meta-commands. `pg_dump` emits `\restrict` / `\unrestrict`,
-  and psycopg has no psql to interpret them - `apply` refuses such a file up front.
-- `apply` holds a session advisory lock for the whole of each target's run (it is taken and
-  released per target), so two containers starting at once serialise instead of racing.
-- `baseline` is how an existing database adopts the system: it writes tracking rows without
-  executing anything.
-- `status --check` exits 1 if anything is pending or drifted/missing, so a deploy script
-  can assert a clean state without parsing output. Every subcommand exits non-zero on
-  failure, which is what makes `apply` safe to run unattended in a playbook that must halt
-  before restarting services against a half-migrated database. `runner.py` catches
-  `Exception` around `init_service` and returns normally, which would exit 0 - deliberate
-  for a long-running service, fatal here - so `migrations/_service.py` converts any
-  non-`SystemExit` failure (unreachable database, permissions error, dropped connection,
-  or a misconfigured `targets` block) into `SystemExit(1)` itself. `KeyboardInterrupt` and
-  `asyncio.CancelledError` are caught separately, ahead of that clause - they derive from
-  `BaseException`, so `except Exception` never sees them, and an interrupt between two
-  migration files would otherwise report success over a partially migrated database. Do
-  not "simplify" either clause away.
-- `commands.py` is importable directly for programmatic use (for example, building a
-  throwaway database in a test harness). `cmd_apply`, `cmd_baseline` and `cmd_repair`
-  require an autocommit connection and refuse otherwise, since each opens and closes its
-  own per-file transactions rather than running inside one the caller opened.
+Explicit encryption of columns the app reads back, plus the E2EE binary envelope. Add `crypto`
+to `SERVICES` for the CLI; the library imports without it.
 
-### Bridge Subsystem (`bridge/`)
+```bash
+python3 src/app.py crypto key
+python3 src/app.py crypto rotate --table T --column C [--id id] [--batch N] [--dry-run]
+```
 
-Tornado-based HTTP and WebSocket server:
-- **`web_app.py`** — Tornado web application setup.
-- **`api.py`** — `ApiHandler` for HTTP requests. Auto-wraps responses in `{"data": ...}`.
-- **`websocket.py`** — `BaseWebSocketHandler` for WebSocket connections. Manages connection lifecycle, auth token caching, heartbeat, message encoding.
-- **`encoders/`** — Pluggable encoders (JSON via msgspec, MessagePack). Encoder is a class attribute on the handler.
-- **`_service.py`** — Bridge startup: loads services, creates web app, forks workers (prod) or runs single-process with autoreload (dev).
+`config["crypto"]` = `{"key": "k1", "keys": {"k1": "APP_CRYPTO_K1"}, "index_key": "APP_CRYPTO_INDEX"}`
 
-### Request Handlers (`request_handler/`)
+- `FieldCrypto.encrypt()` / `decrypt()` / `blind_index()`. Nothing is hooked into the database layer.
+- Format `pa1:<key_id>:<base64 of nonce(12) || ct || tag(16)>`, AES-256-GCM. **Version and key id
+  are bound as AAD.** The estate's other format, `sp1:`, is a different cipher and is refused, never misparsed.
+- Config holds only env var *names*. `decrypt` reads the key id off the value, so a retired key
+  keeps working while listed in `keys` - that is the rotation mechanism, and removing an id is permanent.
+- `decrypt(None)`→`None`, `decrypt("")`→`""`, non-`pa1:` returned verbatim (so a column can hold
+  both mid-backfill). A `pa1:` value that will not open always raises.
+- `blind_index()` gives back equality lookups via a second, separately keyed column - not ranges
+  or `LIKE`, and it deliberately does not normalise case or whitespace.
+- `envelope.py` — Python side of `magic(3) | version(1) | nonce(12) | ct | tag(16)`, the format
+  `copasty-server` clients write. `validate()` is the check a keyless server can still make.
+- `PasswordHasher` wraps bcrypt with `needs_rehash()`. No salt column - bcrypt embeds it.
 
-- **`handlers.py`** — Two distinct base classes:
-  - `RequestHandlerBase` / `WebHandlerBase` — actual Tornado RequestHandlers. Carry request context (`current_user`, `db_pools`, etc.). These are the `bridge_handler`.
-  - `RequestHandlerHelper` — plain Python class for action dispatch. NOT a Tornado handler. Gets `bridge_handler` passed in. This is what service handlers extend.
-- **`decorators.py`** — Route/auth decorators (see Decorator Stack below).
-- **`auth_service.py`** — JWT creation/verification (user, device, impersonation tokens).
-- **`pagination.py`** — `parse_pagination()` helper.
+## Audit Trail (`audit/`)
 
-### WebSocket Connection Manager (`wbcm/`)
+One row per recorded change, written explicitly. No ORM hook, no middleware, no trigger.
 
-Redis-backed pub/sub for multi-instance WebSocket message relay:
-- **`wb_connection_manager.py`** — Runs in background thread. Reads Redis stream, routes messages to local connections via `call_soon_threadsafe`.
-- **`factory.py`** — `UserConnections`: uid→connection mapping, user_id→[uid] index.
-- **`device_connections.py`** — `DeviceConnections`: device_id→connection tracking.
-- **`ws_interface.py`** — `WebSocketHandlerInterface` ABC.
+```bash
+python3 src/app.py audit install [--dir PATH] [--table NAME]
+python3 src/app.py audit prune --before YYYY-MM-DD [--batch N] [--dry-run]
+```
 
-### Supporting Modules
+`config["audit"]` = `{"db": "main", "table": "audit_log", "strict": True, "max_rows": 1000,
+"id_key": "id", "exclude": {"users": ["password"]}}`
 
-- **`http_exception.py`** — `HTTPException(message, code, http_status)` with `to_dict()`.
-- **`return_model.py`** — `StatusModel`, `MessageModel`, `ReturnModel` for standardized responses.
-- **`tick_service.py`** — Periodic tick service base with signal handling and graceful shutdown.
-- **`timer.py`** — Hierarchical performance timer with table/CSV output.
-- **`utils.py`** — `json_encode/decode` (msgspec), `sha256_hash`, `generate_random_string`, type conversion helpers.
+- **The audit row is written on the caller's cursor, inside the caller's transaction** - a
+  rolled-back change takes its row with it. No buffering, no batching, no shutdown flush.
+  **A refactor must not defer the write.**
+- `update()`/`delete()` read affected rows before writing, so old values need no hand-written
+  before-fetch. `max_rows` is checked on that read, before anything is written.
+- `insert()` always uses `RETURNING`; any other way of getting the id means guessing at a sequence,
+  and the failure mode is an empty `entity_id`.
+- Comparison is neither `==` nor `str()` - `diff.same()` normalises per type, since psycopg
+  returns real types. The boolean truthy table applies **only when one side is a real bool**,
+  which stops a text `"true"` equalling `"1"`.
+- Request context is a per-request `ContextVar` (`request_context(...)`), never process-wide.
+- `strict` (default on) raises on a failed write. With it off, note a failed INSERT still aborts
+  the surrounding Postgres transaction - use a savepoint.
+- A malformed `exclude` block is refused at construction; redaction fails open by nature.
+- Columns are cut to fit rather than rejected.
+- `audit install` writes the schema into the *project's* migrations directory - the framework
+  ships no migration of its own.
+
+## Job Queue (`queue/`)
+
+```bash
+python3 src/app.py queue install [--dir PATH]
+python3 src/app.py queue work [--queue a,b] [--once] [--stop-when-empty]
+                              [--max-jobs N] [--max-time N] [--timeout N] [--sleep N]
+python3 src/app.py queue status | failed [--limit N] | retry (--id N|--all) | forget (...)
+```
+
+`config["queue"]` = `{"driver": "database", "db": "main", "table": "queue_jobs",
+"failed_table": "queue_failed_jobs", "queue": "default", "tries": 3, "backoff": [10, 60, 300],
+"timeout": 300, "sleep": 1.0, "handlers": {}}`
+
+- **A push is an `INSERT`, so it joins the transaction that caused it** - the whole argument for
+  keeping jobs in the application's own database.
+- Reserving is a candidate `SELECT ... FOR UPDATE SKIP LOCKED` then a guarded `UPDATE` in one
+  transaction, retried five times. **The guard in the `WHERE` - not `SKIP LOCKED` - is what makes
+  the claim safe.** Do not simplify it away.
+- A claim is a **deadline, not a flag**: `reserved_until` in the past means the worker died, so
+  the job is claimable with its attempt already spent. No heartbeat, no lease renewal.
+- The handler runs with **no queue transaction open**.
+- **Reserving is the attempt** - `attempts` increments on claim, first `handle()` sees 1, and
+  `release()` never touches it.
+- Queue precedence is sequential, not a merged sort: `["high", "default"]` drains `high` first.
+- Every time comparison binds an application-computed UTC value, never `now()`.
+- Uniqueness is scoped to pending, released on completion and failure; one partial unique index.
+- Payloads are JSON, never pickle - an unpickle here would be RCE in a table. An undecodable
+  payload goes straight to failed.
+- Per-job timeout is `asyncio.timeout()`, which cancels a task blocked in a query; the visibility
+  timeout backstops a worker that dies outright.
+- Handler names resolve as `module:attr` or a configured alias, alias first - a renamed class
+  keeps working without touching the rows naming it.
+- Exit contract: `0` for every ordinary end, `1` only for repeated reserve failures. A failed
+  *job* never changes the exit code.
+
+### The Redis driver
+
+`config["queue"]["driver"] = "redis"` and nothing else moves. Both drivers satisfy `QueueDriver`
+in `interface.py`; `tests/test_queue_contract.py` runs one suite against both. Add
+`{"hostname":..., "port": 6379, "database": 0, "password":..., "prefix": "queue:", "group":
+"workers"}` - deliberately **not** the cache connection, which is one `FLUSHDB` from an empty backlog.
+
+- **Streams, not lists**: a consumer group keeps every delivered entry until acknowledged, and
+  `XAUTOCLAIM` returns one after the visibility timeout.
+- One stream per priority (`q:{queue}:s:{n}`), a sorted set for scheduled, a hash per job. Stream
+  entries are immutable, so the stream indexes what is *ready* and carries only the id; the hash is the job.
+- `XAUTOCLAIM` runs **before** `XREADGROUP` per level, so a dead worker's job beats new work.
+- The group is created at `0`, not `$` - jobs are pushed before any worker starts.
+- `XAUTOCLAIM` knows idle time, not liveness. `reserved_until` is authoritative, so an entry
+  reclaimed while its claim is valid is **parked** back into the delayed set, costing no attempt.
+- Min-idle-time comes from the reclaiming worker, so `timeout` must be one value fleet-wide.
+- One shared consumer name for the whole fleet; who holds a job is in `reserved_by`.
+- A failed job **keeps its id** (unlike the database driver), so `queue retry` restores the job
+  that failed. `retry --id` on a job that is not failed does nothing.
+- `queue install` prints "nothing to install" and exits 0, so a playbook can run it either way.
+- Needs Redis 6.2+ (`XAUTOCLAIM`), **not cluster aware**.
+- **Cannot** join the transaction that caused the push - it is a second system. Use it when
+  volume warrants it or losing a job is survivable.
+
+## Rate Limiting (`throttle/`)
+
+Fixed-window counting on Redis. `@rate_limit` is built on it and keeps its signature.
+
+```python
+attempt = await Throttle(redis_con).hit(f"login:{email}", 5, 900)
+if not attempt.allowed:
+    raise HTTPException("Too many attempts", code=4029, http_status=429)
+
+await throttle.clear(f"login:{email}")   # the moment the protected thing succeeds
+```
+
+`config["throttle"]` = `{"prefix": "throttle:", "fail_open": True}`
+
+- The window opens on the first hit and closes `window` seconds later; the known cost is the
+  boundary - 5 per 15 min has a worst case of 10 in quick succession.
+- `hit()` counts allowed or not, so hammering neither resets nor extends the window. `check()`
+  peeks without counting. `clear()` on success is what stops a near-lockout after a typo.
+- `Attempt` carries `allowed/limit/hits/remaining/retry_after/reset_at` and `headers()`
+  (`X-RateLimit-*`, plus `Retry-After` only when denied).
+- Counting is a single Lua script, so it is **exact** at the same one round trip.
+- Stored state is `{hits, reset}`; the **reset timestamp is authoritative**, not the key's TTL.
+- Keys are stored as `sha256(caller_key)` - it is routinely an email or IP.
+- `fail_open` defaults to true; the line is always logged.
 
 ## Decorator Stack
 
@@ -244,118 +296,77 @@ Redis-backed pub/sub for multi-instance WebSocket message relay:
 @action("verb")           # Register as routable action (MUST be outermost)
 @authenticated            # Require bridge_handler.current_user is not None
 @with_db                  # Inject self.pg_conn, self.pg_cur, self.db_wrapper
-@with_tx                  # Wrap in PostgreSQL transaction (MUST come after @with_db)
+@with_tx                  # PostgreSQL transaction (MUST come after @with_db)
 async def method(self, input_data: dict) -> dict:
 ```
 
-Other decorators:
-- `@with_cache` — inject `self.redis_con`
-- `@with_cache_and_db` — both Redis + PostgreSQL
-- `@rate_limit(max_requests, window_seconds)` — Redis-backed rate limiter (MUST come after @with_cache)
-- `@require_auth_for_actions` — class decorator, applies `@authenticated` to all @action
-  methods, inherited ones included (dispatch resolves actions across the MRO, so
-  guarding only the class's own methods would leave base-class actions open)
+- `@with_cache` — inject `self.redis_con`; `@with_cache_and_db` — both
+- `@rate_limit(max_requests, window_seconds)` — MUST come after `@with_cache`
+- `@require_auth_for_actions` — class decorator applying `@authenticated` to all `@action`
+  methods, inherited ones included (dispatch resolves across the MRO, so guarding only the
+  class's own methods would leave base-class actions open)
 
-## Error Handling
+## Error Handling & Protocol
 
-```python
-raise HTTPException("message", code=-404, http_status=404)
-```
+`raise HTTPException("message", code=-404, http_status=404)`
 
-Error responses are wrapped inside `data`, like all responses:
+The `data` field is the sole payload container; `msg_id`, `service`, `auth_token` and
+`device_session_token` are protocol envelope only. Errors are wrapped in `data` like everything else.
+
 ```json
-{"msg_id": 1, "service": "...", "data": {"error": {"msg": "...", "code": -404}}}
+// Client → Server
+{"msg_id": 1, "service": "name", "auth_token": "jwt...",
+ "data": {"action": "action_name", "data": {"...payload..."}}}
+
+// Server → Client, success then error
+{"msg_id": 1, "service": "name", "data": {"status": "ok"}}
+{"msg_id": 1, "service": "name", "data": {"error": {"code": -404, "msg": "Not found"}}}
 ```
 
-Success responses:
-```json
-{"msg_id": 1, "service": "...", "data": {"status": "ok"}}
-```
-
-The `data` field is the sole payload container — `msg_id` and `service` are protocol envelope only.
-
-This holds for HTTP too: `WebHandlerBase.error()` wraps both `HTTPException` and plain
-string errors in `data`, so an HTTP client parses `data.error` exactly like a WebSocket
-client. The HTTP status still carries `http_status` from the exception.
-
-HTTP status codes from `ApiHandler`:
-
-- `HTTPException` → its own `http_status`
-- any other exception → `500` (a server-side fault, never a 4xx)
-- action returns `None` → `204` with no body, mirroring the WebSocket path, which
-  simply sends nothing in the same case
-
-## WebSocket Protocol
-
-Messages have two layers:
-- **Protocol envelope**: `msg_id`, `service`, `auth_token`, `device_session_token` — routing, correlation, authentication
-- **Payload**: `data` — ALL application content (success or error)
-
-### Client → Server
-```json
-{
-  "msg_id": 1,
-  "service": "service_name",
-  "auth_token": "jwt...",
-  "data": {"action": "action_name", "data": {"...payload..."}}
-}
-```
-
-### Server → Client (Success)
-```json
-{"msg_id": 1, "service": "service_name", "data": {"...response..."}}
-```
-
-### Server → Client (Error)
-```json
-{"msg_id": 1, "service": "service_name", "data": {"error": {"code": -404, "msg": "Not found"}}}
-```
+This holds for HTTP too - `WebHandlerBase.error()` wraps both `HTTPException` and plain string
+errors in `data`. Status codes from `ApiHandler`: `HTTPException` → its own `http_status`; any
+other exception → `500`, never a 4xx; an action returning `None` → `204` with no body, mirroring
+the WebSocket path.
 
 ## Downstream Integration
 
-Projects integrate by:
+1. **`app.py`** — configure `AppRegistry` (config, models, Redis channel), call `main()`.
+2. **`config.py`** — `load_config(defaults=..., split_value_keys=[...])`.
+3. **`src/services/<name>/_service_pybridge.py`** — export `bridge_request(action, request_data, bridge_handler)`.
+4. **Handlers** — extend `RequestHandlerHelper`, use `@action` + the decorator stack.
+5. Optional: custom `WebSocketHandler` (extends `BaseWebSocketHandler`), custom `WebApplication`.
 
-1. **`app.py`** — Configure `AppRegistry` with project config, models, Redis channel. Call `main()`.
-2. **`config.py`** — `load_config(defaults=..., split_value_keys=[...])` to load `.env` into nested dict.
-3. **`src/services/<name>/_service_pybridge.py`** — Export `bridge_request(action, request_data, bridge_handler)`.
-4. **Handler classes** — Extend `RequestHandlerHelper`, use `@action` + decorator stack.
-5. **Optional overrides**: custom `WebSocketHandler` (extends `BaseWebSocketHandler`), custom `WebApplication` (extends `WebApplication`).
+**`RequestHandlerHelper` instances are per-request.** `handle_request()` stores `bridge_handler`
+on `self`, and `@with_db`/`@with_cache` attach then delete `pg_conn`/`pg_cur`/`db_wrapper`/
+`redis_con` on `self`. Construct a fresh handler inside `bridge_request()` - a module-level
+singleton would let concurrent requests overwrite each other's connections and `current_user`.
 
-**`RequestHandlerHelper` instances are per-request.** `handle_request()` stores
-`bridge_handler` on `self`, and `@with_db` / `@with_cache` attach and then delete
-`pg_conn` / `pg_cur` / `db_wrapper` / `redis_con` on `self`. Construct a fresh handler
-inside `bridge_request()`; a module-level singleton would let concurrent requests
-overwrite each other's connections, transactions and `current_user`.
-
-### Config keys the framework reads
+Config keys the framework reads:
 
 - `api.key` (str or list) — static API key(s) when `api_key_use_db=False`
 - `api_key_pepper` — pepper for hashed API keys when `api_key_use_db=True`
 - `jwt.secret` — HS256 signing secret
-- `ws_allowed_origins` (str or list) — accepted WebSocket `Origin` values; falls back to
-  the `WS_ALLOWED_ORIGINS` env var. Empty means accept any origin, which logs a warning
-  in prod.
+- `ws_allowed_origins` (str or list) — accepted WebSocket `Origin`s; falls back to the
+  `WS_ALLOWED_ORIGINS` env var. Empty accepts any origin and logs a warning in prod.
 - `sentry.dsn`, `sentry.rate.performance`, `sentry.rate.profiles`
 
-Note the env-var mapping splits on `_`, so a nested key path must not run through a key
-that already holds a scalar (`API_KEY_PEPPER` cannot coexist with `api.key`). Such a
-variable is logged and skipped rather than silently clobbering the scalar.
+The env-var mapping splits on `_`, so a nested path must not run through a key already holding a
+scalar (`API_KEY_PEPPER` cannot coexist with `api.key`). Such a variable is logged and skipped.
 
-## Key Paths
+## Key Paths & Style
 
 ```
 src/py_app_runner/          # Package source
-docker/app/Dockerfile       # Multi-stage Dockerfile (base -> builder -> development)
-scripts/                    # Project-root scripts (code_tests, bump_version, pre-commit)
+docker/app/Dockerfile       # Multi-stage (base -> builder -> development)
+scripts/                    # version, release_tag, bump_version, pre-commit
 docker-compose.yml          # Development service
-pyproject.toml              # Project metadata, dependencies, ruff config
+pyproject.toml              # Metadata, dependencies, ruff config
+.version                    # Manual major.minor; CI appends the commit count
+LICENSE                     # MIT, shipped in the distributions
 ```
 
-## Code Style
-
 - Python 3.11+, async/await with Tornado and uvloop
-- Ruff linter: line-length 120, rules E/F/I/B/UP
-- Double quotes, space indentation
+- Ruff: line-length 120, rules E/F/I/B/UP. Double quotes, space indentation
 - Type hints on all function signatures
 - Always use braces/blocks for conditionals (no single-line ifs)
 - File-scoped imports only — never inside functions

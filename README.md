@@ -5,7 +5,15 @@ Async Python service framework: Tornado HTTP/WS bridge, PyBridge service loader,
 ## Install
 
 ```bash
-pip install git+ssh://git@github.com/4Apps/py_app_runner.git
+pip install py_app_runner
+```
+
+Every push to `develop` publishes a pre-release, `X.Y.<commit count>.dev0`. pip hides those
+unless you ask for them:
+
+```bash
+pip install --pre py_app_runner        # newest, including dev builds
+pip install py_app_runner==0.4.50.dev0 # a specific dev build
 ```
 
 ## Development

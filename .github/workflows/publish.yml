@@ -1,62 +1,86 @@
-name: Build & Publish
+name: Publish
 
-# Manual only. Pushes to master are tested by test.yml; cutting a wheel is a
-# deliberate act because the artifact is permanent and downstream projects pin it.
+# A GitHub release is the trigger, not a push. A version on PyPI is permanent - it cannot
+# be replaced, and a deleted one cannot be re-uploaded - so minting one stays a deliberate
+# act. Pushing the tag is safe; creating the release from it is the point of no return.
 on:
-  workflow_dispatch:
+  release:
+    types: [published]
 
 jobs:
-  build:
-    name: Build & Publish
-    runs-on: self-hosted
+  test:
+    name: Tests
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    name: Build & Publish to PyPI
+    needs: [test]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # Mandatory for trusted publishing; no API token is stored anywhere
+      id-token: write
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.release.tag_name }}
+          # scripts/version.bash derives the patch from the commit count, so it needs the
+          # full history - a shallow clone would silently produce version .1
           fetch-depth: 0
 
-      - name: Resolve build version
+      # A GitHub pre-release would publish a plain final version here, which is not what
+      # the marking says. Pre-releases come off develop, automatically, as .devN
+      - name: Refuse a GitHub pre-release
+        if: ${{ github.event.release.prerelease }}
         run: |
-          MAJOR_MINOR=$(cat .version)
-          COUNT=$(git rev-list --count HEAD)
-          VERSION="${MAJOR_MINOR}.${COUNT}"
+          echo "::error::${{ github.event.release.tag_name }} is marked as a pre-release." >&2
+          echo "Pre-releases are published from the develop branch as X.Y.N.dev0." >&2
+          exit 1
+
+      # The tag is written by hand often enough to be worth checking against the derived
+      # value. A mismatch here means the tag and the wheel would disagree about what this
+      # release is, which nothing downstream can untangle afterwards.
+      - name: Resolve and verify version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="$(scripts/version.bash)"
+          if [ "$TAG" != "v${VERSION}" ]; then
+            echo "::error::tag ${TAG} does not match the derived version v${VERSION}." >&2
+            echo "Tags are created by scripts/release_tag.bash; delete this one and re-cut it." >&2
+            exit 1
+          fi
           echo "$VERSION" > .version
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "Building py_app_runner $VERSION"
+          echo "Publishing py_app_runner $VERSION"
 
-      - name: Create docker external network
-        run: docker network create py_app_runner_network || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
-      - name: Pull latest base image
-        run: docker pull debian:trixie-slim
+      - name: Install build tooling
+        run: python -m pip install -U build twine
 
-      - name: Build development image
-        run: docker compose build develop
-
-      - name: Run code tests
-        run: docker compose run --rm develop /srv/meta/scripts/code_tests.bash
-
-      - name: Build wheel
+      - name: Build sdist and wheel
         run: |
-          rm -rf build dist
-          docker compose run --rm develop pip wheel /srv/app --no-deps -w /srv/app/dist
+          rm -rf dist
+          python -m build
 
-      # The runner lives on processing, the wheels are served from 4apps.lv
-      - name: Publish wheel
-        env:
-          PUBLISH_HOST: services@4apps.lv
-          PUBLISH_DIR: /srv/services/4apps-www/public/apps/py
+      # An unreadable or empty .version makes setuptools fall back to 0.0.0 rather than
+      # fail, and 0.0.0 on PyPI could never be withdrawn. Assert the filename rather than
+      # trusting that the rewrite above landed.
+      - name: Verify built version
         run: |
-          NAME="py_app_runner-${VERSION}-py3-none-any.whl"
-          scp -o BatchMode=yes "dist/$NAME" "$PUBLISH_HOST:$PUBLISH_DIR/$NAME"
-          ssh -o BatchMode=yes "$PUBLISH_HOST" \
-            "ln -sfn '$NAME' '$PUBLISH_DIR/py_app_runner-latest-py3-none-any.whl'"
-          echo "Published $NAME"
+          if [ ! -f "dist/py_app_runner-${VERSION}-py3-none-any.whl" ]; then
+            echo "::error::expected dist/py_app_runner-${VERSION}-py3-none-any.whl, built:" >&2
+            ls -1 dist >&2
+            exit 1
+          fi
 
-  cleanup:
-    name: Cleanup
-    runs-on: self-hosted
-    needs: [build]
-    if: always()
-    steps:
-      - name: Clean up dist
-        run: rm -rf dist/
+      # Catches a README that will not render on PyPI, which is otherwise only found out
+      # by the upload failing after the release has already been published
+      - name: Check distributions
+        run: twine check --strict dist/*
+
+      # No skip-existing: a duplicate here means the release was cut twice and should fail
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
