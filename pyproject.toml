@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools >= 61.0.0"]
+# PEP 639 license expressions (the "license"/"license-files" keys below) need 77+
+requires = ["setuptools >= 77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,8 +9,37 @@ dynamic = ["version"]
 description = "Async service framework: Tornado HTTP/WS bridge, service loader, Redis WS connection manager"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "GNU General Public License v3.0 (GPL-3.0)" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Gints Murans", email = "gm@gm.lv" }]
+keywords = [
+    "async",
+    "tornado",
+    "websocket",
+    "framework",
+    "service",
+    "redis",
+    "postgresql",
+    "migrations",
+    "queue",
+]
+# No "License ::" classifier: it is deprecated alongside Metadata 2.4, and setuptools
+# refuses one next to the license expression above
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    # uvloop is a hard dependency and does not build on Windows
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
 
 dependencies = [
     "sentry-sdk",
@@ -18,16 +48,21 @@ dependencies = [
     "msgspec",
     "msgpack",
     "tornado",
-    "database_wrapper == 0.2.38",
-    "database_wrapper[pgsql] == 0.2.38",
-    "database_wrapper[redis] == 0.2.38",
+    # The extras pull the base package in, so one pin rather than three that must be kept
+    # in lockstep. 0.3.146 is the first MIT release - 0.2.38 and earlier are GPL-3.0.
+    "database_wrapper[pgsql,redis] == 0.3.146",
     # Used directly by py_app_runner.migrations, not only through database_wrapper, so the
-    # floor is declared here rather than inherited. Matches database_wrapper_pgsql 0.2.38's
+    # floor is declared here rather than inherited. Matches database_wrapper_pgsql 0.3.146's
     # own psycopg[binary]/psycopg[pool] >= 3.2.0.
     "psycopg >= 3.2.0",
     "psycopg[pool] >= 3.2.0",
     "redis",
     "pyjwt",
+    # Used directly by py_app_runner.crypto for AES-256-GCM. The floor is 44 because that
+    # is where XChaCha20Poly1305 appears, which is the obvious alternative if AES-GCM's
+    # 96-bit nonce ever becomes uncomfortable for a high-volume column.
+    "cryptography >= 44",
+    "bcrypt",
 ]
 
 [project.optional-dependencies]
@@ -39,12 +74,23 @@ dev = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/4Apps/py_app_runner"
+Documentation = "https://github.com/4Apps/py_app_runner/blob/master/AGENTS.md"
 Code = "https://github.com/4Apps/py_app_runner"
+"Issue Tracker" = "https://github.com/4Apps/py_app_runner/issues"
+Download = "https://pypi.org/project/py-app-runner/"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# Manual major.minor in .version; CI appends the git commit count as the patch part
+# Without the marker file in the wheel, a downstream type checker ignores every
+# annotation in this package (PEP 561)
+[tool.setuptools.package-data]
+"py_app_runner" = ["py.typed"]
+
+# Manual major.minor in .version; CI appends the git commit count as the patch part.
+# A local build therefore reports a bare "0.4" - scripts/version.bash prints what a
+# release of this commit would actually publish as.
 [tool.setuptools.dynamic]
 version = { file = ".version" }
 

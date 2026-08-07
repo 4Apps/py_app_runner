@@ -8,6 +8,7 @@ from typing_extensions import ParamSpec
 
 from py_app_runner.http_exception import HTTPException
 from py_app_runner.request_handler.handlers import RequestHandlerHelper
+from py_app_runner.throttle import Throttle
 
 rate_limit_logger = logging.getLogger(__name__ + ".rate_limit")
 audit_logger = logging.getLogger(__name__ + ".audit")
@@ -179,6 +180,11 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
     Key is derived from user ID (if authenticated) or client IP.
     Must be applied AFTER @with_cache or @with_cache_and_db (so self.redis_con exists).
     Returns HTTP 429 with Retry-After header when limit is exceeded.
+
+    Counting is done by py_app_runner.throttle, which is also callable directly for
+    anything that is not a bridge action - a login form keyed by email, say. Sharing the
+    implementation is what keeps the window semantics in one place; before, this decorator
+    was the only thing that could count, so every other caller invented its own.
     """
 
     def decorator(func: AsyncMethod) -> AsyncMethod:
@@ -205,19 +211,11 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
             scope = f"{type(self).__module__}.{type(self).__qualname__}"
             key = f"rl:{scope}:{action_name}:{identity}"
 
-            # INCR and TTL in one round trip. Re-arming the TTL whenever it is missing
-            # also repairs keys left without an expiry by a crash between the two calls,
-            # which would otherwise lock the identity out permanently.
-            async with redis_con.pipeline(transaction=True) as pipe:
-                current, ttl = await pipe.incr(key).ttl(key).execute()
+            attempt = await Throttle(redis_con).hit(key, max_requests, window_seconds)
 
-            if ttl < 0:
-                await redis_con.expire(key, window_seconds)
-                ttl = window_seconds
-
-            if current > max_requests:
+            if not attempt.allowed:
                 raise HTTPException(
-                    f"Rate limit exceeded. Try again in {ttl} seconds.",
+                    f"Rate limit exceeded. Try again in {attempt.retry_after} seconds.",
                     code=4029,
                     http_status=429,
                 )

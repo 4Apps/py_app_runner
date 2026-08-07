@@ -3,6 +3,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from py_app_runner.http_exception import HTTPException
 from py_app_runner.request_handler.decorators import (
@@ -14,6 +15,7 @@ from py_app_runner.request_handler.decorators import (
     require_auth_for_actions,
 )
 from py_app_runner.request_handler.handlers import RequestHandlerHelper
+from tests.redis_harness import redis_for
 
 
 class TestSanitizeInput:
@@ -123,55 +125,8 @@ class TestRequireAuthForActions:
         assert "ping" in Handler._get_actions()
 
 
-class FakePipeline:
-    def __init__(self, store: dict[str, int], ttls: dict[str, int]):
-        self.store = store
-        self.ttls = ttls
-        self.ops: list[tuple[str, str]] = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc: Any) -> None:
-        return None
-
-    def incr(self, key: str):
-        self.ops.append(("incr", key))
-        return self
-
-    def ttl(self, key: str):
-        self.ops.append(("ttl", key))
-        return self
-
-    async def execute(self) -> list[int]:
-        results: list[int] = []
-        for op, key in self.ops:
-            if op == "incr":
-                self.store[key] = self.store.get(key, 0) + 1
-                results.append(self.store[key])
-            else:
-                results.append(self.ttls.get(key, -1))
-        self.ops = []
-        return results
-
-
-class FakeRedis:
-    def __init__(self):
-        self.store: dict[str, int] = {}
-        self.ttls: dict[str, int] = {}
-        self.expire_calls: list[tuple[str, int]] = []
-
-    def pipeline(self, transaction: bool = True) -> FakePipeline:
-        return FakePipeline(self.store, self.ttls)
-
-    async def expire(self, key: str, seconds: int) -> bool:
-        self.ttls[key] = seconds
-        self.expire_calls.append((key, seconds))
-        return True
-
-
 class RateLimitedHandler:
-    def __init__(self, redis_con: FakeRedis):
+    def __init__(self, redis_con: Any):
         self.redis_con = redis_con
         self.bridge_handler = MagicMock()
         self.bridge_handler.current_user = MagicMock(id=7)
@@ -182,37 +137,64 @@ class RateLimitedHandler:
 
 
 class TestRateLimit:
-    def test_allows_up_to_the_limit_then_raises(self):
-        redis_con = FakeRedis()
+    """Counting moved into py_app_runner.throttle, which is covered in depth by
+    test_throttle.py. What is left to prove here is the decorator's own job: deriving the
+    key, and turning a denial into a 429.
+
+    These run against a real Redis rather than a fake, because the counting is now a Lua
+    script and a fake would be asserting against a reimplementation of it.
+    """
+
+    @pytest_asyncio.fixture
+    async def redis_con(self):
+        async with redis_for(database=3) as con:
+            yield con
+
+    async def test_allows_up_to_the_limit_then_raises(self, redis_con):
         handler = RateLimitedHandler(redis_con)
 
-        assert asyncio.run(handler.limited({})) == "ok"
-        assert asyncio.run(handler.limited({})) == "ok"
+        assert await handler.limited({}) == "ok"
+        assert await handler.limited({}) == "ok"
 
         with pytest.raises(HTTPException) as excinfo:
-            asyncio.run(handler.limited({}))
+            await handler.limited({})
         assert excinfo.value.http_status == 429
 
-    def test_ttl_is_rearmed_when_missing(self):
-        # A crash between INCR and EXPIRE leaves a key with no TTL; without repair
-        # the identity stays locked out forever.
-        redis_con = FakeRedis()
+    async def test_the_denial_says_when_to_come_back(self, redis_con):
         handler = RateLimitedHandler(redis_con)
-        asyncio.run(handler.limited({}))
+        await handler.limited({})
+        await handler.limited({})
 
-        key = redis_con.expire_calls[0][0]
-        del redis_con.ttls[key]
+        with pytest.raises(HTTPException) as excinfo:
+            await handler.limited({})
+        assert "seconds" in str(excinfo.value.message)
 
-        asyncio.run(handler.limited({}))
-        assert redis_con.expire_calls[-1] == (key, 60)
-
-    def test_key_is_scoped_per_handler_class(self):
-        redis_con = FakeRedis()
+    async def test_key_is_scoped_per_handler_class(self, redis_con):
+        """The same action name in two services would otherwise share a single bucket."""
 
         class OtherHandler(RateLimitedHandler):
             pass
 
-        asyncio.run(RateLimitedHandler(redis_con).limited({}))
-        asyncio.run(OtherHandler(redis_con).limited({}))
+        await RateLimitedHandler(redis_con).limited({})
+        await OtherHandler(redis_con).limited({})
 
-        assert len(redis_con.store) == 2
+        assert len(await redis_con.keys("*")) == 2
+
+    async def test_key_is_scoped_per_identity(self, redis_con):
+        first = RateLimitedHandler(redis_con)
+        second = RateLimitedHandler(redis_con)
+        second.bridge_handler.current_user = MagicMock(id=8)
+
+        await first.limited({})
+        await second.limited({})
+
+        assert len(await redis_con.keys("*")) == 2
+
+    async def test_without_redis_it_warns_and_lets_the_call_through(self):
+        """Enforcement is best-effort by design: a cache outage must not take the
+        application down with it."""
+
+        handler = RateLimitedHandler(None)
+        handler.redis_con = None
+
+        assert await handler.limited({}) == "ok"

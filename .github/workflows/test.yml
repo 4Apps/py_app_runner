@@ -1,20 +1,28 @@
 name: Tests
 
 on:
+  # Deliberately not develop: publish-dev.yml already calls this workflow on every develop
+  # push, and listing it here too would start the suite twice for one push
   push:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  # Both publish workflows call this rather than repeating the docker steps, so a release
+  # can never be built from a tree the suite has not run against. workflow_call reuses the
+  # definition, not the result - the suite genuinely runs again against the tagged tree.
+  workflow_call:
 
 jobs:
   test:
     name: Build & Test
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Create docker external network
-        run: docker network create py_app_runner_network || true
+      - name: Match container user to runner user
+        run: |
+          echo "LOCAL_USER_ID=$(id -u)" >> "$GITHUB_ENV"
+          echo "LOCAL_GROUP_ID=$(id -g)" >> "$GITHUB_ENV"
 
       - name: Pull latest base image
         run: docker pull debian:trixie-slim

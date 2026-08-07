@@ -17,12 +17,28 @@ services:
       retries: 30
       start_period: 5s
 
+  # Throttle counts in a Lua script and the queue's redis driver runs on consumer groups
+  # and XAUTOCLAIM. What a group does with two readers, and what XAUTOCLAIM counts as idle,
+  # is exactly what a hand written fake gets wrong, so those tests want a real server.
+  cache_db:
+    image: redis:7.4-alpine
+    container_name: py_app_runner_cache
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+
   # Development
   develop:
     container_name: py_app_runner_develop
     restart: "no"
     depends_on:
       main_db:
+        condition: service_healthy
+      cache_db:
         condition: service_healthy
     build:
       context: .
