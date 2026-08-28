@@ -52,7 +52,7 @@ To migrate more than one database, opt in with `config["migrations"]["targets"]`
 }
 ```
 
-Each target's `db` names a key under `config["db"]` and defaults to the target's own name;
+Each target's `db` names a key under `config["db"]` and defaults to the target's own name.
 `dir` and `table` default as above. `status` and `apply` with no `--target` run every
 target in declared order (`apply` stops at the first one that fails; `status --check`
 reports each target rather than stopping at the first with pending work, and exits 1 if any
