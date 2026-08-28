@@ -338,6 +338,18 @@ errors in `data`. Status codes from `ApiHandler`: `HTTPException` → its own `h
 other exception → `500`, never a 4xx; an action returning `None` → `204` with no body, mirroring
 the WebSocket path.
 
+Over HTTP the JSON body *is* the request; the query string may only name the `action` (the URL
+path wins). Nothing else from the URL reaches a service - it would sit in access logs and caches
+as input. The API key is read from `X-API-Key` only, never `?api_key=`; a browser WebSocket
+client, which cannot set headers, sends `api_key` in its first message instead.
+
+`log_request()` writes headers and the body at WARNING on every `HTTPException`, so both go
+through key-based redaction: any header name or JSON key containing `authorization`, `cookie`,
+`password`, `passwd`, `secret`, `token`, `api-key`/`api_key`/`apikey` or `credential` is logged
+as `<redacted>` (`utils.is_sensitive_key`). Substring on purpose - a project's `X-Auth-Token` or
+`refresh_token` is covered without the framework knowing the name. Over-redaction in a log is
+the cheap failure; extend the marker list rather than special-casing a call site.
+
 ## Downstream Integration
 
 1. **`app.py`** — configure `AppRegistry` (config, models, Redis channel), call `main()`.

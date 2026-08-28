@@ -278,15 +278,29 @@ async def run_blocking(fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) ->
     return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
 
 
+SENSITIVE_KEY_MARKERS = (
+    "authorization",
+    "cookie",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api-key",
+    "api_key",
+    "apikey",
+    "credential",
+)
+
+
+def is_sensitive_key(name: Any) -> bool:
+    """Substring match on header names and JSON keys, so `X-Auth-Token`, `auth_token`,
+    `refresh_token` and `client_secret` are all caught without listing each one."""
+    lowered = str(name).lower()
+    return any(marker in lowered for marker in SENSITIVE_KEY_MARKERS)
+
+
 def redact_headers(headers: dict[str, Any]) -> dict[str, Any]:
-    redacted: dict[str, Any] = {}
-    for k, v in (headers or {}).items():
-        kl = str(k).lower()
-        if kl in ("authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"):
-            redacted[k] = "<redacted>"
-        else:
-            redacted[k] = v
-    return redacted
+    return {k: ("<redacted>" if is_sensitive_key(k) else v) for k, v in (headers or {}).items()}
 
 
 def sha1_prefix(b: bytes, n: int = 12) -> str:
@@ -300,13 +314,16 @@ def sha256_hash(s: str) -> str:
 def shrink_json(obj: Any, *, max_string: int, max_items: int) -> Any:
     """
     Traverse JSON-like structures and:
+      - redact values under credential-looking keys (see is_sensitive_key),
       - truncate any string longer than max_string (base64-aware summary),
       - cap lists to max_items with a "… N more items" marker,
       - leave numbers/bools/None untouched.
-    No key-based assumptions.
     """
     if isinstance(obj, dict):
-        return {k: shrink_json(v, max_string=max_string, max_items=max_items) for k, v in obj.items()}
+        return {
+            k: ("<redacted>" if is_sensitive_key(k) else shrink_json(v, max_string=max_string, max_items=max_items))
+            for k, v in obj.items()
+        }
     if isinstance(obj, list):
         trimmed = [shrink_json(x, max_string=max_string, max_items=max_items) for x in obj[:max_items]]
         if len(obj) > max_items:
