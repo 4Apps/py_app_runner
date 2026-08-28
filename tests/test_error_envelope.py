@@ -7,6 +7,9 @@ from py_app_runner.http_exception import HTTPException
 from py_app_runner.registry import AppRegistry
 from py_app_runner.utils import json_decode
 
+from .api_harness import FakeService
+from .api_harness import make_api_app as _make_api_app
+
 
 def make_app() -> Application:
     from py_app_runner.request_handler.handlers import WebHandlerBase
@@ -32,39 +35,15 @@ def make_app() -> Application:
     )
 
 
-class FakeService:
-    """Stands in for a services.<name>._service_pybridge module."""
-
-    requires_api_key = False
-
-    def __init__(self, result: Any = None, error: Exception | None = None):
-        self.result = result
-        self.error = error
-
-    async def bridge_request(self, action: str, request_data: dict[str, Any], bridge_handler: Any) -> Any:
-        if self.error is not None:
-            raise self.error
-        return self.result
-
-
 def make_api_app() -> Application:
-    from py_app_runner.bridge.api import ApiHandler
-    from py_app_runner.pybridge import PyBridge
-    from py_app_runner.request_handler.handlers import WebApplicationBase
-
-    class ApiApplication(WebApplicationBase):
-        pass
-
-    app = ApiApplication([(r"/api/([^/]+)", ApiHandler)])
-
-    pybridge = PyBridge()
-    pybridge.cache_service("boom", FakeService(error=RuntimeError("service exploded")))
-    pybridge.cache_service("known", FakeService(error=HTTPException("nope", code=-7, http_status=403)))
-    pybridge.cache_service("fine", FakeService(result={"status": "ok"}))
-    pybridge.cache_service("silent", FakeService(result=None))
-    app.set_pybridge(pybridge)
-
-    return app
+    return _make_api_app(
+        {
+            "boom": FakeService(error=RuntimeError("service exploded")),
+            "known": FakeService(error=HTTPException("nope", code=-7, http_status=403)),
+            "fine": FakeService(result={"status": "ok"}),
+            "silent": FakeService(result=None),
+        }
+    )
 
 
 class TestApiHandlerStatus(AsyncHTTPTestCase):

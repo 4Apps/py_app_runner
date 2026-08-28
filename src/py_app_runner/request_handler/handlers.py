@@ -153,25 +153,15 @@ class RequestHandlerBase(web.RequestHandler):
         )
 
     def get_request_data(self, force_action: str | None = None) -> dict[str, Any]:
-        query_params = self.request.query_arguments
-        decoded_params: dict[str, Any] = {}
+        """The JSON body is the request. The URL may only name the action - anything else
+        in the query string would end up in access logs and caches as service input."""
+        request_data: dict[str, Any] = dict(self.json_args or {})
 
-        for k, v in query_params.items():
-            # Check if there's only one item in the list
-            if len(v) == 1:
-                decoded_params[k] = v[0].decode("utf-8")
-            else:
-                # Decode each item in the list
-                decoded_params[k] = [item.decode("utf-8") for item in v]
+        action = force_action or request_data.get("action") or self.get_query_argument("action", None)
+        if action:
+            request_data["action"] = action
 
-        request_body = {}
-        if hasattr(self, "json_args") and self.json_args:
-            request_body = self.json_args
-
-        if force_action:
-            request_body["action"] = force_action
-
-        return {**decoded_params, **request_body}
+        return request_data
 
     def error(
         self,
@@ -232,7 +222,7 @@ class RequestHandlerBase(web.RequestHandler):
             method,
             path,
             body_len,
-            args if isinstance(args, dict) else "<n/a>",  # type: ignore
+            redact_headers(args) if isinstance(args, dict) else "<n/a>",
         )
 
         # details go at DEBUG unless we're already warning/error, then use same level
@@ -270,12 +260,12 @@ class RequestHandlerBase(web.RequestHandler):
             await res
 
         # Debug
-        headers = dict(self.request.headers)
-        headers.pop("Authorization", None)
-
         self.logger.debug(f"Request: {self.request}")
-        self.logger.debug(f"Headers: {headers}")
-        self.logger.debug(f"Body: {self.request.body!r}")
+        self.logger.debug("Headers: %s", redact_headers(dict(self.request.headers)))
+        self.logger.debug(
+            "Body: %s",
+            format_body_for_log(self.request.body, max_chars=4000, shrink_strings_to=256, cap_list_items=50),
+        )
         self.logger.debug(f"Arguments: {self.request.arguments.keys()}")
 
         self._ensure_content_type()
@@ -458,9 +448,6 @@ class RequestHandlerApiKeys(RequestHandlerBase):
 
     async def has_valid_api_key(self, custom_api_key: str | None = None) -> str | Literal[True]:
         api_key: str | None = custom_api_key or self.request.headers.get("X-API-Key", None)  # type: ignore
-        if api_key is None:
-            api_key = self.get_argument("api_key", None)
-
         if api_key is None:
             return "API key is missing"
 
