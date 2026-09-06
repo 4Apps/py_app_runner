@@ -273,6 +273,51 @@ in `interface.py`; `tests/test_queue_contract.py` runs one suite against both. A
 - **Cannot** join the transaction that caused the push - it is a second system. Use it when
   volume warrants it or losing a job is survivable.
 
+## Scheduled Jobs (`cron/`)
+
+Laravel's scheduler shape: the system crontab calls `cron run` once a minute, and it starts
+whatever is due. Add `cron` to `SERVICES` to enable.
+
+```bash
+python3 src/app.py cron list
+python3 src/app.py cron run  [--job NAME] [--dry-run]
+python3 src/app.py cron work
+```
+
+```python
+"cron": {
+    "db": "main",                # advisory-lock connection; defaults to main
+    "timezone": "Europe/Riga",   # default for every job; UTC when absent
+    "jobs": {
+        "lad-sync": {"schedule": "0 4 * * 0", "command": "parcel lad sync"},
+        "cleanup":  {"schedule": "15 4 * * *", "command": "cron cleanup", "timeout": 1800},
+    },
+}
+```
+
+- **A job is an `app.py` subcommand**, run as a child of the scheduler with the same
+  interpreter, script, cwd, `.env` and `-v` level. No handler import, no callable form: a
+  project that wants a callable writes a subcommand. `command` is split with `shlex`.
+- **Due means "matches this minute"**, evaluated by `cronsim` in the job's zone. There is no
+  run history and no catch-up: a minute that was missed is simply missed, exactly as with
+  the crontab that calls it. `--job NAME` runs a job now regardless of its schedule.
+- **One Postgres advisory lock per job, held by the scheduler for as long as the child runs.**
+  A tick that finds the lock taken logs a warning and skips, exit 0 - that is the lock
+  working, not a failure. A scheduler that dies drops the lock with its connection but
+  leaves the child orphaned, so a job must survive that one overlap. `dry-run` and a tick
+  with nothing due open no database connection.
+- Every due job starts at once; `run` returns when the last has ended. Exit `1` if any job
+  exited non-zero or was killed for its `timeout` (SIGTERM, then SIGKILL after 10s), `2`
+  for a config error or an unknown `--job`. SIGTERM to the scheduler is forwarded to the
+  children and reported as exit `1`.
+- `work` spawns one `cron run` child per minute boundary and never waits on it, so a slow
+  job cannot delay the next tick. Stopping it terminates the ticks still running.
+- Every job is validated at load: unknown keys, a bad expression, an unknown zone or a
+  non-positive `timeout` refuse the whole service, found by the first `cron list` rather
+  than by a job that silently never fires.
+- Children inherit stdout/stderr, so output goes wherever the scheduler's does (the
+  crontab's `| logger -t`, or the container log under `work`).
+
 ## Rate Limiting (`throttle/`)
 
 Fixed-window counting on Redis. `@rate_limit` is built on it and keeps its signature.

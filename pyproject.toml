@@ -22,6 +22,7 @@ keywords = [
     "postgresql",
     "migrations",
     "queue",
+    "cron",
 ]
 # No "License ::" classifier: it is deprecated alongside Metadata 2.4, and setuptools
 # refuses one next to the license expression above
@@ -63,6 +64,8 @@ dependencies = [
     # 96-bit nonce ever becomes uncomfortable for a high-volume column.
     "cryptography >= 44",
     "bcrypt",
+    # Cron expression matching for py_app_runner.cron. Zero dependencies, DST-aware.
+    "cronsim",
 ]
 
 [project.optional-dependencies]

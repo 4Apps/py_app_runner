@@ -85,3 +85,34 @@ need an explicit `table` on at least one of them.
 - Every subcommand exits non-zero on failure, including a misconfigured `targets` block.
   `status --check` exits 1 if anything is pending, drifted or missing, so a deploy script
   can halt before restarting services against a half-migrated database.
+
+## Scheduled jobs
+
+Built-in service that runs `app.py` subcommands on a cron schedule declared in config, the
+way Laravel's scheduler does: the system crontab calls `cron run` once a minute and it
+starts whatever is due. Add `cron` to `SERVICES` to enable it.
+
+```bash
+python3 src/app.py cron list                       # every job, its schedule and next run
+python3 src/app.py cron run  [--job NAME] [--dry-run]
+python3 src/app.py cron work                       # the same, looping, for a container without a crontab
+```
+
+```python
+"cron": {
+    "timezone": "Europe/Riga",
+    "jobs": {
+        "lad-sync": {"schedule": "0 4 * * 0", "command": "parcel lad sync"},
+        "cleanup":  {"schedule": "15 4 * * *", "command": "cron cleanup", "timeout": 1800},
+    },
+}
+```
+
+```
+* * * * * app cd /srv/app && python3 src/app.py cron run 2>&1 | logger -t cron
+```
+
+Each job runs as its own `app.py` process, so a wedged or leaking job takes only itself
+down and `timeout` can kill it. A Postgres advisory lock per job stops a tick from starting
+a second copy of one still running. There is no run history and no catch-up: a job is due
+when its expression matches the current minute, and a missed minute is missed.
