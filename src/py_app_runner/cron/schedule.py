@@ -12,7 +12,10 @@ import zoneinfo
 from dataclasses import dataclass
 from typing import Any
 
-from cronsim import CronSim, CronSimError
+try:
+    from cronsim import CronSim, CronSimError
+except ImportError as e:
+    raise ImportError("py_app_runner.cron requires the 'cron' extra: pip install 'py_app_runner[cron]'") from e
 
 _DEFAULTS: dict[str, Any] = {
     "db": "main",

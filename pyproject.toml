@@ -59,17 +59,25 @@ dependencies = [
     "psycopg[pool] >= 3.2.0",
     "redis",
     "pyjwt",
-    # Used directly by py_app_runner.crypto for AES-256-GCM. The floor is 44 because that
-    # is where XChaCha20Poly1305 appears, which is the obvious alternative if AES-GCM's
-    # 96-bit nonce ever becomes uncomfortable for a high-volume column.
-    "cryptography >= 44",
-    "bcrypt",
-    # Cron expression matching for py_app_runner.cron. Zero dependencies, DST-aware.
-    "cronsim",
 ]
 
+# A service that is not in SERVICES is never imported, so its library need not be installed.
+# The import site raises a message naming the extra when it is missing.
 [project.optional-dependencies]
+crypto = [
+    # AES-256-GCM. The floor is 44 because that is where XChaCha20Poly1305 appears, which
+    # is the obvious alternative if AES-GCM's 96-bit nonce ever becomes uncomfortable for
+    # a high-volume column.
+    "cryptography >= 44",
+    "bcrypt",
+]
+cron = [
+    # Cron expression matching. Zero dependencies, DST-aware.
+    "cronsim",
+]
+all = ["py_app_runner[crypto,cron]"]
 dev = [
+    "py_app_runner[all]",
     "pyrefly",
     "ruff",
     "pytest",

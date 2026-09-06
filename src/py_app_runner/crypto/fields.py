@@ -21,8 +21,11 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+try:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError as e:
+    raise ImportError("py_app_runner.crypto requires the 'crypto' extra: pip install 'py_app_runner[crypto]'") from e
 
 from py_app_runner.crypto.errors import CryptoError
 

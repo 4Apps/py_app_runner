@@ -6,7 +6,10 @@ second copy of something the hash already carries, and has to be kept in step wi
 no benefit.
 """
 
-import bcrypt
+try:
+    import bcrypt
+except ImportError as e:
+    raise ImportError("py_app_runner.crypto requires the 'crypto' extra: pip install 'py_app_runner[crypto]'") from e
 
 from py_app_runner.crypto.errors import CryptoError
 

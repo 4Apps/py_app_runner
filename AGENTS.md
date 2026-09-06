@@ -10,6 +10,7 @@ docker compose up develop          # Postgres (main_db) + Redis (cache_db) + dev
 docker compose exec develop bash
 
 pip install py_app_runner          # as a dependency elsewhere
+pip install 'py_app_runner[crypto,cron]'  # extras: field encryption, scheduler
 pip install --pre py_app_runner    # include develop-branch pre-releases
 
 /srv/meta/scripts/code_tests.bash  # tests, inside the container
@@ -161,7 +162,8 @@ Mixing `targets` with a top-level `dir`/`table` is rejected.
 
 ## Field Encryption (`crypto/`)
 
-Explicit encryption of columns the app reads back, plus the E2EE binary envelope. Add `crypto`
+Explicit encryption of columns the app reads back, plus the E2EE binary envelope. Needs the
+`crypto` extra (`cryptography`, `bcrypt`); the import raises naming it otherwise. Add `crypto`
 to `SERVICES` for the CLI; the library imports without it.
 
 ```bash
@@ -276,7 +278,7 @@ in `interface.py`; `tests/test_queue_contract.py` runs one suite against both. A
 ## Scheduled Jobs (`cron/`)
 
 Laravel's scheduler shape: the system crontab calls `cron run` once a minute, and it starts
-whatever is due. Add `cron` to `SERVICES` to enable.
+whatever is due. Needs the `cron` extra (`cronsim`); add `cron` to `SERVICES` to enable.
 
 ```bash
 python3 src/app.py cron list

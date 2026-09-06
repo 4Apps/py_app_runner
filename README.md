@@ -5,7 +5,8 @@ Async Python service framework: Tornado HTTP/WS bridge, PyBridge service loader,
 ## Install
 
 ```bash
-pip install py_app_runner
+pip install py_app_runner                # the bridge, migrations, queue, audit, throttle
+pip install 'py_app_runner[crypto,cron]'  # field encryption and the scheduler need their extras
 ```
 
 Every push to `develop` publishes a pre-release, `X.Y.<commit count>.dev0`. pip hides those
@@ -90,7 +91,7 @@ need an explicit `table` on at least one of them.
 
 Built-in service that runs `app.py` subcommands on a cron schedule declared in config, the
 way Laravel's scheduler does: the system crontab calls `cron run` once a minute and it
-starts whatever is due. Add `cron` to `SERVICES` to enable it.
+starts whatever is due. Needs the `cron` extra; add `cron` to `SERVICES` to enable it.
 
 ```bash
 python3 src/app.py cron list                       # every job, its schedule and next run
