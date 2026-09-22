@@ -126,6 +126,9 @@ class ApiHandler(WebHandlerBase):
             if not action:
                 raise HTTPException("Missing action", code=1005, http_status=400)
 
+            if requires_api_key is not False:
+                await self.enforce_api_key(str(service), action)
+
             return_data = await bridge_request(action, input_data, self)
             if return_data is not None:
                 self.write(return_data)

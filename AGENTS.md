@@ -320,6 +320,56 @@ python3 src/app.py cron work
 - Children inherit stdout/stderr, so output goes wherever the scheduler's does (the
   crontab's `| logger -t`, or the container log under `work`).
 
+## API Keys (`api_keys/`)
+
+Scoped keys for `api_key_use_db=True`. Add `api_keys` to `SERVICES` for the CLI; the bridge
+enforces keys without it.
+
+```bash
+python3 src/app.py api_keys install [--dir PATH]
+python3 src/app.py api_keys create --name N --ability A [--ability ...] [--allowed-ip CIDR ...]
+                                   [--expires DATE] [--user-id N]
+python3 src/app.py api_keys list
+python3 src/app.py api_keys revoke <id|prefix>
+python3 src/app.py api_keys update <id|prefix> [--name N] [--ability A ...] [--add-ability A ...]
+       [--remove-ability A ...] [--allowed-ip CIDR ... | --any-ip] [--expires DATE | --no-expiry]
+       [--user-id N | --no-user]
+```
+
+Config: `api_key_pepper` (flat key), `trusted_proxies` (list or CSV of IPs/CIDRs, env fallback
+`TRUSTED_PROXIES`). `AppRegistry.configure(api_keys_model=...)` is optional and defaults to
+`ApiKeysModel`; subclass it to add columns or rename the table.
+
+- Table `api_keys`: `name, key_prefix (unique), secret_hash, abilities text[], allowed_ips cidr[]
+  (NULL = any), expires_at, user_id, last_used_at, total_uses, created_at, updated_at,
+  disabled_at`. The key is `<prefix>.<secret>`, stored as `sha256(pepper || secret)`; `create`
+  prints it once. The app adds the `user_id` foreign key itself.
+- Abilities are `service:action`, `service:*`, `*`, matched against the normalised service name
+  and the top-level action (URL/body action over HTTP, `data.action` over WS). **Deny by
+  default**: an empty list allows nothing. Finer checks inside a service use
+  `bridge_handler.key_can("service:thing")`.
+- **Unscoped, on purpose:** a static `api.key`, a `has_valid_key_db` override returning `True`,
+  and a record whose model has no `abilities` attribute. Projects on their own key model keep
+  today's behaviour until they move to `ApiKeysModel`.
+- `has_valid_key_db` returns the record (or the refusal string); `has_valid_api_key` still
+  returns `True` and stores it as `bridge_handler.current_api_key`.
+- Refusals: bad secret, disabled, expired, IP not allowed, inactive acting-as user → 401 /
+  `1401` (WS handshake: close 4401). Missing ability → 403 / `1403`. The secret is checked
+  before key state, so an unknown caller learns nothing about a prefix.
+- `enforce_api_key(service, action)` runs in both bridges once the action is resolved, only for
+  services whose `requires_api_key` is not `False`.
+- **Client IP is the socket peer**, not `request.remote_ip` - the server runs `xheaders=True`,
+  which believes forwarding headers from anyone. `X-Forwarded-For` (rightmost untrusted hop)
+  and `X-Real-IP` count only when the peer is in `trusted_proxies`. Empty = never.
+- `user_id` makes the key act as that user when **no token was presented** - an invalid or
+  expired JWT does not fall back to it. Loaded through the overridable
+  `load_user_by_id(user_id) -> user | None` (default: `users_model` by `id`, refusing
+  `disabled_at`/`deleted_at`); None refuses the request.
+- WebSocket: the key is validated once per connection; abilities and expiry per message; the
+  record and the key's user are re-read every `api_key_recheck_seconds` (30), so a revoke or
+  disabled user lands within that window. The key's user is applied only to messages for
+  key-requiring services, and the connection is assigned to that user's fan-out.
+
 ## Rate Limiting (`throttle/`)
 
 Fixed-window counting on Redis. `@rate_limit` is built on it and keeps its signature.
@@ -414,6 +464,8 @@ Config keys the framework reads:
 
 - `api.key` (str or list) — static API key(s) when `api_key_use_db=False`
 - `api_key_pepper` — pepper for hashed API keys when `api_key_use_db=True`
+- `trusted_proxies` (str or list) — proxies whose `X-Forwarded-For`/`X-Real-IP` the key IP check
+  believes; falls back to the `TRUSTED_PROXIES` env var. Empty believes none.
 - `jwt.secret` — HS256 signing secret
 - `ws_allowed_origins` (str or list) — accepted WebSocket `Origin`s; falls back to the
   `WS_ALLOWED_ORIGINS` env var. Empty accepts any origin and logs a warning in prod.

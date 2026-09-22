@@ -1,5 +1,4 @@
 import datetime
-import hashlib
 import hmac
 import inspect
 import logging
@@ -13,6 +12,8 @@ from database_wrapper_pgsql import DBWrapperPgsqlAsync, PgConnectionTypeAsync, P
 from redis.asyncio import Redis as RedisClientAsync
 from tornado import httputil, web
 
+from py_app_runner.api_keys.abilities import ability_allows
+from py_app_runner.api_keys.keys import expired, ip_allowed, secret_matches, split_key
 from py_app_runner.registry import AppRegistry
 
 from ..db_pools import DbPools
@@ -31,6 +32,7 @@ from ..utils import (
 )
 from ..wbcm.wb_connection_manager import WbConnectionManager
 from .auth_service import AuthService
+from .client_ip import resolve_client_ip, trusted_proxies
 
 BridgeRequestData = dict[str, Any]
 BridgeRequest = Callable[[str, BridgeRequestData, "RequestHandlerBase"], Any]
@@ -150,6 +152,20 @@ class RequestHandlerBase(web.RequestHandler):
                 bridge_request,
                 requires_api_key,
             ),
+        )
+
+    def client_ip(self) -> str | None:
+        """The client's address for access decisions - not `request.remote_ip`, which
+        `xheaders=True` fills from headers anyone can send. See `client_ip.py`."""
+        context = getattr(self.request.connection, "context", None)
+        address = getattr(context, "address", None)
+        peer = address[0] if isinstance(address, tuple) and address else None
+
+        return resolve_client_ip(
+            peer,
+            self.request.headers.get("X-Forwarded-For"),
+            self.request.headers.get("X-Real-IP"),
+            trusted_proxies(),
         )
 
     def get_request_data(self, force_action: str | None = None) -> dict[str, Any]:
@@ -392,44 +408,77 @@ class RequestHandlerBase(web.RequestHandler):
 
 
 class RequestHandlerApiKeys(RequestHandlerBase):
+    # Set by a successful has_valid_api_key. A verified key without a record - a static
+    # `api.key`, or a has_valid_key_db override returning True - is unscoped, as is a record
+    # whose model declares no `abilities`. Deny by default applies to models that do.
+    _api_key_verified: bool = False
+    _current_api_key: Any | None = None
+    _api_key_user_applied: bool = False
+
+    @property
+    def current_api_key(self) -> Any | None:
+        """The key record this request was authenticated with, or None."""
+        return self._current_api_key
+
+    def key_can(self, ability: str) -> bool:
+        """Whether the request's API key grants `ability` ('service:action'). False
+        when no key was used."""
+        if not self._api_key_verified:
+            return False
+
+        record = self._current_api_key
+        if record is None or not hasattr(record, "abilities"):
+            return True
+
+        return ability_allows(record.abilities, ability)
+
     #########################
     ### Validate api keys ###
     #########################
 
     def verify_api_key(self, api_key_secret: str, stored_hash: str) -> bool:
-        h = hashlib.sha256()
-        h.update(AppRegistry.config()["api_key_pepper"].encode())
-        h.update(api_key_secret.encode())
-        computed = h.hexdigest()
+        return secret_matches(api_key_secret, AppRegistry.config()["api_key_pepper"], stored_hash)
 
-        return hmac.compare_digest(computed, stored_hash)
+    def api_key_refusal(self, record: Any) -> str | None:
+        """Why a key whose secret matched may not be used now, or None if it may."""
+        if getattr(record, "disabled_at", None):
+            return "API key is disabled"
 
-    async def has_valid_key_db(self, api_key: str, db_cur: PgCursorTypeAsync) -> str | Literal[True]:
-        api_key_split = api_key.split(".", 1)
-        if len(api_key_split) != 2:
-            return "Invalid API KEY"
+        if expired(getattr(record, "expires_at", None)):
+            return "API key has expired"
 
-        api_key_prefix, api_key_secret = api_key_split
+        allowed_ips = getattr(record, "allowed_ips", None)
+        if allowed_ips is not None and not ip_allowed(self.client_ip(), allowed_ips):
+            return "API key is not allowed from this address"
 
-        # Load from db
+        return None
+
+    async def has_valid_key_db(self, api_key: str, db_cur: PgCursorTypeAsync) -> Any:
+        """The key's record, or a string saying why it was refused."""
+        parts = split_key(api_key)
+        if parts is None:
+            return "Invalid API key"
+
+        api_key_prefix, api_key_secret = parts
+
         async with self.timer.aenter("request_handler.has_valid_key_db.load_from_db"):
             db_wrapper = DBWrapperPgsqlAsync(db_cur)
             api_key_model = AppRegistry.api_keys_model()
             api_key_record = await db_wrapper.get_by_key(api_key_model(), id_key="key_prefix", id_value=api_key_prefix)
 
-        if not api_key_record:
-            return "Invalid API Key"
-
-        if api_key_record.disabled_at:
-            return "API key is disabled"
-
-        if not self.verify_api_key(api_key_secret, api_key_record.secret_hash):
+        # State is checked only after the secret, so an unauthenticated caller learns
+        # nothing about a prefix it happens to know.
+        if not api_key_record or not self.verify_api_key(api_key_secret, api_key_record.secret_hash):
             return "Invalid API key"
+
+        refusal = self.api_key_refusal(api_key_record)
+        if refusal:
+            return refusal
 
         async with self.timer.aenter("request_handler.has_valid_key_db.use_key"):
             await api_key_record.use_key(db_cur)
 
-        return True
+        return api_key_record
 
     def has_valid_key(self, api_key: str) -> str | Literal[True]:
         configured_key = AppRegistry.config().get("api", {}).get("key")
@@ -453,14 +502,84 @@ class RequestHandlerApiKeys(RequestHandlerBase):
 
         api_key = str(api_key)
 
+        result: Any
         if AppRegistry.api_key_use_db():
             async with self.db_pools.main_db_pool as (pg_conn, pg_cur):
                 if not pg_cur or not pg_conn:
                     raise HTTPException("Database is not initialized")
                 async with pg_conn.transaction():
-                    return await self.has_valid_key_db(api_key, pg_cur)
+                    result = await self.has_valid_key_db(api_key, pg_cur)
+        else:
+            result = self.has_valid_key(api_key)
 
-        return self.has_valid_key(api_key)
+        if isinstance(result, str):
+            return result
+
+        self._api_key_verified = True
+        self._current_api_key = None if result is True else result
+        return True
+
+    ###########################
+    ### Scopes and identity ###
+    ###########################
+
+    async def enforce_api_key(self, service_name: str, action: str) -> None:
+        """Apply the verified key's abilities and acting-as user to this call.
+
+        Runs once the action is resolved, and only for services that require a key.
+        """
+        record = self._current_api_key
+        if record is not None and hasattr(record, "abilities"):
+            ability = f"{service_name.replace('-', '_')}:{action}"
+            if not ability_allows(record.abilities, ability):
+                raise HTTPException(f"API key may not call {ability}", code=1403, http_status=403)
+
+        await self._apply_api_key_user()
+
+    async def load_user_by_id(self, user_id: int) -> Any | None:
+        """The user an API key acts as, or None if it must not act as them.
+
+        Override to apply the same checks the application's own authentication applies.
+        """
+        UsersModel = AppRegistry.users_model()
+        async with self.db_pools.main_db_pool as (pg_conn, pg_cur):
+            if not pg_cur or not pg_conn:
+                raise HTTPException("Database is not initialized", 500, http_status=500)
+
+            user = await DBWrapperPgsqlAsync(pg_cur).get_by_key(UsersModel(), id_key="id", id_value=user_id)
+
+        if not user or getattr(user, "disabled_at", None) or getattr(user, "deleted_at", None):
+            return None
+
+        return user
+
+    async def _api_key_user(self, user_id: int) -> Any | None:
+        return await self.load_user_by_id(user_id)
+
+    async def _apply_api_key_user(self) -> None:
+        # Any token presented wins, valid or not: a client whose JWT expired must not
+        # silently carry on as the key's user.
+        user_id = getattr(self._current_api_key, "user_id", None)
+        if not user_id or self.auth_token:
+            return
+
+        user = await self._api_key_user(user_id)
+        if user is None:
+            self._clear_current_user()
+            raise HTTPException(
+                "Application is not authenticated: API key user is not active",
+                code=1401,
+                http_status=401,
+            )
+
+        self._current_user_obj = user
+        if hasattr(self, "_current_user"):
+            del self._current_user
+        self._api_key_user_applied = True
+
+        uid = getattr(self, "uid", None)
+        if uid:
+            self.wb_connection_manager.user_connections.assign_user_id(uid, str(user.id))
 
 
 class WebHandlerBase(RequestHandlerApiKeys):

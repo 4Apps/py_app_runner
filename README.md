@@ -117,3 +117,27 @@ Each job runs as its own `app.py` process, so a wedged or leaking job takes only
 down and `timeout` can kill it. A Postgres advisory lock per job stops a tick from starting
 a second copy of one still running. There is no run history and no catch-up: a job is due
 when its expression matches the current minute, and a missed minute is missed.
+
+## API keys
+
+With `api_key_use_db=True`, keys live in the `api_keys` table and carry abilities
+(`service:action`, `service:*`, `*`), an optional IP allow-list, an optional expiry and an
+optional user the key acts as. A key with no abilities can call nothing. Add `api_keys` to
+`SERVICES` for the CLI:
+
+```bash
+python3 src/app.py api_keys install                 # writes the schema into data/migrations
+python3 src/app.py api_keys create --name reports-bot --ability sudat_reports:report \
+    --allowed-ip 10.0.0.0/8 --expires 2027-12-31 --user-id 5
+python3 src/app.py api_keys list
+python3 src/app.py api_keys update <id|prefix> --add-ability sudat_reports:export
+python3 src/app.py api_keys revoke <id|prefix>
+```
+
+`create` prints the key once; only a peppered hash (`config["api_key_pepper"]`) is stored.
+Clients send it as `X-API-Key`. A call outside the key's abilities gets 403 with code `1403`.
+Behind nginx, list the proxy in `config["trusted_proxies"]` (or `TRUSTED_PROXIES`), or the IP
+allow-list sees the proxy's address rather than the client's.
+
+Inside a service, `bridge_handler.current_api_key` is the key's record and
+`bridge_handler.key_can("service:thing")` checks a finer ability.

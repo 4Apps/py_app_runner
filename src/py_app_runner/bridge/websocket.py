@@ -1,12 +1,15 @@
 import logging
 import os
+import time
 import uuid
 from asyncio import Future, get_event_loop
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
+from database_wrapper_pgsql import DBWrapperPgsqlAsync
 from tornado.websocket import WebSocketHandler as TornadoWebSocketHandler
 
+from py_app_runner.api_keys.keys import expired
 from py_app_runner.bridge.encoders import JsonEncoder, MessageEncoder, MsgpackEncoder
 from py_app_runner.config import is_env_prod
 from py_app_runner.http_exception import HTTPException
@@ -15,6 +18,8 @@ from py_app_runner.request_handler.handlers import RequestHandlerApiKeys
 from py_app_runner.return_model import MessageModel, ReturnModel, StatusModel
 from py_app_runner.utils import json_encode
 from py_app_runner.wbcm.ws_interface import WebSocketHandlerInterface
+
+_UNSET: Any = object()
 
 
 def allowed_ws_origins() -> set[str]:
@@ -40,6 +45,10 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
 
     encoder: MessageEncoder
 
+    # How long a socket trusts its cached key record and the key's user before reading
+    # both again, i.e. how late a revoked key or disabled user is noticed.
+    api_key_recheck_seconds: float = 30
+
     #########################
     ### Class lifecycle #####
     #########################
@@ -57,6 +66,8 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         self.device_id: str | None = None
         self._api_key_valid: bool | None = None
         self._rejected_api_key: str | None = None
+        self._api_key_checked_at = 0.0
+        self._api_key_user_cache: Any = _UNSET
 
         super().__init__(*args, **kwargs)
 
@@ -120,6 +131,66 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         dropped: Future[None] = Future()
         dropped.set_result(None)
         return dropped
+
+    ################
+    ### API keys ###
+    ################
+
+    async def has_valid_api_key(self, custom_api_key: str | None = None) -> str | Literal[True]:
+        status = await super().has_valid_api_key(custom_api_key)
+        if status is True:
+            self._api_key_checked_at = time.monotonic()
+            self._api_key_user_cache = _UNSET
+        return status
+
+    async def _api_key_user(self, user_id: int) -> Any | None:
+        if self._api_key_user_cache is _UNSET:
+            self._api_key_user_cache = await self.load_user_by_id(user_id)
+        return self._api_key_user_cache
+
+    def _drop_api_key_user(self) -> None:
+        # The key's user is applied per message, and only for services that require a
+        # key. The fan-out assignment stays: it belongs to the connection.
+        if self._api_key_user_applied:
+            self._api_key_user_applied = False
+            self._current_user_obj = None
+            if hasattr(self, "_current_user"):
+                del self._current_user
+
+    async def _recheck_api_key(self) -> None:
+        """Re-read the connection's key record once it is older than
+        api_key_recheck_seconds, so revoking or narrowing a key reaches an open socket."""
+        record = self._current_api_key
+        if record is None or not getattr(record, "id", None):
+            return
+
+        refusal: str | None = None
+        if time.monotonic() - self._api_key_checked_at >= self.api_key_recheck_seconds:
+            async with self.db_pools.main_db_pool as (pg_conn, pg_cur):
+                if not pg_cur or not pg_conn:
+                    raise HTTPException("Database is not initialized", 500, http_status=500)
+                fresh = await DBWrapperPgsqlAsync(pg_cur).get_by_key(
+                    AppRegistry.api_keys_model()(), id_key="id", id_value=record.id
+                )
+
+            self._api_key_checked_at = time.monotonic()
+            self._api_key_user_cache = _UNSET
+            if fresh is None:
+                refusal = "API key no longer exists"
+            else:
+                self._current_api_key = fresh
+                refusal = self.api_key_refusal(fresh)
+
+        elif expired(getattr(record, "expires_at", None)):
+            refusal = "API key has expired"
+
+        if refusal:
+            self._api_key_valid = False
+            self._api_key_verified = False
+            self._current_api_key = None
+            if not self.auth_token:
+                self._clear_current_user()
+            raise HTTPException(f"Application is not authenticated: {refusal}", code=1401, http_status=401)
 
     ########################
     ### Request handling ###
@@ -185,6 +256,8 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             return
 
         try:
+            self._drop_api_key_user()
+
             # Assign message id
             msg_id = message_data.get("msg_id", None)
             service = message_data.get("service", None)
@@ -231,6 +304,8 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
                         http_status=401,
                     )
 
+                await self._recheck_api_key()
+
             # Set auth token
             auth_token = message_data.get("auth_token", None)
             if auth_token:
@@ -249,6 +324,9 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
 
                 if not action:
                     raise HTTPException("Missing action", code=1005, http_status=400)
+
+                if requires_api_key is not False:
+                    await self.enforce_api_key(str(self.service), action)
 
                 # Run request handler
                 return_data = await bridge_request(action, input_data, self)

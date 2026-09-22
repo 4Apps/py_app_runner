@@ -95,9 +95,10 @@ Download = "https://pypi.org/project/py-app-runner/"
 where = ["src"]
 
 # Without the marker file in the wheel, a downstream type checker ignores every
-# annotation in this package (PEP 561)
+# annotation in this package (PEP 561). The SQL templates are what the `install`
+# subcommands copy into a project.
 [tool.setuptools.package-data]
-"py_app_runner" = ["py.typed"]
+"py_app_runner" = ["py.typed", "*/files/*.sql"]
 
 # Manual major.minor in .version; CI appends the git commit count as the patch part.
 # A local build therefore reports a bare "0.4" - scripts/version.bash prints what a
