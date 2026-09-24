@@ -278,23 +278,40 @@ async def run_blocking(fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) ->
     return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
 
 
+# Bare "auth", "user" and "sas" are left out on purpose: they would hit `author`, `user_id`
+# and `sass_file`. The cost accepted instead is `bypass`, `session_count` or `last_login`.
 SENSITIVE_KEY_MARKERS = (
     "authorization",
     "cookie",
-    "password",
-    "passwd",
+    "pass",
+    "pwd",
     "secret",
     "token",
     "api-key",
     "api_key",
     "apikey",
+    "private_key",
+    "private-key",
+    "privatekey",
+    "account_key",
+    "accountkey",
     "credential",
+    "connection_string",
+    "connectionstring",
+    "conn_str",
+    "dsn",
+    "salt",
+    "signature",
+    "session",
+    "username",
+    "user_name",
+    "login",
 )
 
 
 def is_sensitive_key(name: Any) -> bool:
     """Substring match on header names and JSON keys, so `X-Auth-Token`, `auth_token`,
-    `refresh_token` and `client_secret` are all caught without listing each one."""
+    `db_password` and `client_secret` are all caught without listing each one."""
     lowered = str(name).lower()
     return any(marker in lowered for marker in SENSITIVE_KEY_MARKERS)
 

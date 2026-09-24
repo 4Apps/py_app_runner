@@ -441,11 +441,17 @@ as input. The API key is read from `X-API-Key` only, never `?api_key=`; a browse
 client, which cannot set headers, sends `api_key` in its first message instead.
 
 `log_request()` writes headers and the body at WARNING on every `HTTPException`, so both go
-through key-based redaction: any header name or JSON key containing `authorization`, `cookie`,
-`password`, `passwd`, `secret`, `token`, `api-key`/`api_key`/`apikey` or `credential` is logged
-as `<redacted>` (`utils.is_sensitive_key`). Substring on purpose - a project's `X-Auth-Token` or
-`refresh_token` is covered without the framework knowing the name. Over-redaction in a log is
-the cheap failure; extend the marker list rather than special-casing a call site.
+through key-based redaction: any header name or JSON key containing a marker from
+`utils.SENSITIVE_KEY_MARKERS` (`pass`, `secret`, `token`, `dsn`, `session`, `username`, ...) is
+logged as `<redacted>` (`utils.is_sensitive_key`). Substring on purpose - a project's
+`X-Auth-Token` or `db_password` is covered without the framework knowing the name. Over-redaction
+in a log is the cheap failure; extend the marker list rather than special-casing a call site.
+Bare `auth`, `user` and `sas` stay out - they would hit `author`, `user_id` and `sass_file`.
+
+Sentry uses the same list. `InitSentry` turns off frame locals (the resolved config is a local in
+`runner.main`, so every stack trace would ship it) and installs `SensitiveKeyScrubber`, which masks
+matching keys at any depth in extras, breadcrumbs and request data - copying nested containers,
+never mutating the application's own objects. Keys only: a password inside a URL value still passes.
 
 ## Downstream Integration
 

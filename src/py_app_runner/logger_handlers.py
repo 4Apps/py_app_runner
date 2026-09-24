@@ -9,12 +9,15 @@ from typing import TypedDict
 import sentry_sdk
 from sentry_sdk.integrations.redis import RedisIntegration
 from sentry_sdk.integrations.tornado import TornadoIntegration
+from sentry_sdk.scrubber import EventScrubber
 from sentry_sdk.types import Event, Hint
+from sentry_sdk.utils import AnnotatedValue
 
 from py_app_runner.registry import AppRegistry
 
 from .colors import Colors
 from .http_exception import HTTPException
+from .utils import is_sensitive_key
 
 # Constants
 ERROR_RATE = 60  # Minute
@@ -76,9 +79,9 @@ def InitSentry(
 
     logger.debug("Enabling Sentry logging")
     server_ip = socket.gethostbyname(socket.gethostname())
-    with sentry_sdk.configure_scope() as scope:
-        scope.set_tag("server_ip", server_ip)
-        scope.set_level(args.sv)
+    scope = sentry_sdk.get_isolation_scope()
+    scope.set_tag("server_ip", server_ip)
+    scope.set_level(args.sv)
 
     # Tracing/profiling rates come from config when a project sets them; 0 disables.
     rates = (config.get("sentry") or {}).get("rate") or {}
@@ -89,6 +92,9 @@ def InitSentry(
         environment=environment,
         server_name=server_name,
         attach_stacktrace=True,
+        # The resolved config is a local in runner.main, so every stack trace would carry it.
+        include_local_variables=False,
+        event_scrubber=SensitiveKeyScrubber(recursive=True),
         before_send=RateControl,
         integrations=[TornadoIntegration(), RedisIntegration()],
         traces_sample_rate=float(rates.get("performance", 0) or 0),
@@ -101,6 +107,34 @@ def InitSentry(
 ###############
 ### Classes ###
 ###############
+
+
+class SensitiveKeyScrubber(EventScrubber):
+    """The SDK's denylist plus `is_sensitive_key`, since the stock match is by exact name and
+    misses `db_password`. Keys are matched, never values: a password inside a URL still passes.
+
+    Nested containers are scrubbed as copies - extras and breadcrumb data hold live references
+    into the application's own objects.
+    """
+
+    def scrub_dict(self, d: object) -> None:
+        if not isinstance(d, dict):
+            return
+
+        for k, v in d.items():
+            if isinstance(k, str) and (k.lower() in self.denylist or is_sensitive_key(k)):
+                d[k] = AnnotatedValue.substituted_because_contains_sensitive_data()
+            elif self.recursive and isinstance(v, (dict, list, tuple)):
+                d[k] = self._scrubbed_copy(v)
+
+    def _scrubbed_copy(self, value: object) -> object:
+        if isinstance(value, dict):
+            copy = dict(value)
+            self.scrub_dict(copy)
+            return copy
+        if isinstance(value, (list, tuple)):
+            return [self._scrubbed_copy(item) for item in value]
+        return value
 
 
 class ConsoleHandler(logging.Handler):

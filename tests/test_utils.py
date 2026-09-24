@@ -1,6 +1,8 @@
 import datetime as dt
 
-from py_app_runner.utils import create_valid_hostname, json_encoder
+import pytest
+
+from py_app_runner.utils import create_valid_hostname, is_sensitive_key, json_encoder
 
 
 class TestJsonEncoderDatetimes:
@@ -29,3 +31,26 @@ class TestCreateValidHostname:
 
     def test_only_separators_collapse_to_empty(self):
         assert create_valid_hostname("...") == ""
+
+
+@pytest.mark.parametrize(
+    ("key", "sensitive"),
+    [
+        ("POSTGRES_PASSWORD", True),
+        ("pg_pass", True),
+        ("azure_client_secret", True),
+        ("X-Auth-Token", True),
+        ("sentry_dsn", True),
+        ("ssh_private_key", True),
+        ("user_name", True),
+        ("author", False),
+        ("authority", False),
+        ("user_id", False),
+        ("user_agent", False),
+        ("sass_file", False),
+        ("hostname", False),
+        ("port", False),
+    ],
+)
+def test_is_sensitive_key(key: str, sensitive: bool):
+    assert is_sensitive_key(key) is sensitive
