@@ -1,15 +1,21 @@
 import asyncio
+import contextlib
 import logging
+import os
 import pathlib
 import socket
 from argparse import Namespace
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import psycopg
+from database_wrapper_sqlite import SqliteAsync
 
+from py_app_runner.db_pools import PGSQL, SQLITE, db_driver
 from py_app_runner.migrations.commands import (
+    Connection,
     Out,
     cmd_apply,
     cmd_baseline,
@@ -32,7 +38,15 @@ def connect_kwargs(db_config: dict[str, Any]) -> dict[str, Any]:
     autocommit is on because this service manages transactions per migration file
     explicitly - an implicit outer transaction would swallow the per-file boundaries and
     make the no-transaction directive impossible to honour.
+
+    Every Postgres-only command (queue, audit, api_keys, crypto) connects through here, so
+    this is where a SQLite database is turned away.
     """
+
+    if db_driver(db_config) != PGSQL:
+        raise ValueError(
+            f"This command needs Postgres; the configured database uses the {db_driver(db_config)!r} driver"
+        )
 
     return {
         "host": db_config["hostname"],
@@ -43,6 +57,24 @@ def connect_kwargs(db_config: dict[str, Any]) -> dict[str, Any]:
         "sslmode": db_config.get("ssl") or "prefer",
         "autocommit": True,
     }
+
+
+@contextlib.asynccontextmanager
+async def connect(db_config: dict[str, Any]) -> AsyncIterator[Connection]:
+    """An autocommit connection on either driver, as the commands require."""
+
+    if db_driver(db_config) == SQLITE:
+        db = SqliteAsync(cast(Any, db_config))
+        await db.open()
+        try:
+            assert db.connection is not None
+            yield db.connection
+        finally:
+            await db.close()
+        return
+
+    async with await psycopg.AsyncConnection.connect(**connect_kwargs(db_config)) as pg_conn:
+        yield pg_conn
 
 
 @dataclass(frozen=True)
@@ -76,6 +108,9 @@ def _database_identity(db_config: dict[str, Any]) -> tuple[Any, Any, Any]:
     collision check below has to compare on this, not on the db key. The port default
     mirrors connect_kwargs, so both agree on what an absent port means.
     """
+
+    if db_driver(db_config) == SQLITE:
+        return (SQLITE, None, os.path.realpath(str(db_config.get("database"))))
 
     return (db_config.get("hostname"), db_config.get("port") or 5432, db_config.get("database"))
 
@@ -250,7 +285,7 @@ async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Log
             logger.debug(f"migrations: target={target.name} dir={target.directory} table={target.table}")
             out = _out_for(target.name, multi)
 
-            async with await psycopg.AsyncConnection.connect(**connect_kwargs(config["db"][target.db])) as conn:
+            async with connect(config["db"][target.db]) as conn:
                 if args.step == "status":
                     target_code = await cmd_status(conn, target.directory, target.table, args.check, out)
                 elif args.step == "apply":

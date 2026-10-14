@@ -92,7 +92,9 @@ Client (HTTP or WS)
 - **`registry.py`** — `AppRegistry` singleton (config, models, Redis channel, web app class). Configure before start.
 - **`config.py`** — `load_config()` maps `ENV_VAR` names into nested dict keys by splitting on
   `_`; only vars whose first key exists in defaults are processed. `is_env_dev/test/prod`.
-- **`db_pools.py`** — PostgreSQL + Redis pool management.
+- **`db_pools.py`** — main pool (Postgres or SQLite, by `driver`) + optional Redis pool;
+  `db_driver()`, `redis_configured()`, `make_db_wrapper()`.
+- **`file_lock.py`** — `flock` helpers for migrations and cron on SQLite.
 - **`bridge/`** — `web_app.py` (Tornado app), `api.py` (`ApiHandler`), `websocket.py`
   (`BaseWebSocketHandler`: lifecycle, token cache, heartbeat), `encoders/` (msgspec JSON /
   MessagePack, chosen by a class attribute), `_service.py` (startup; forks workers in prod,
@@ -109,6 +111,37 @@ Client (HTTP or WS)
   (`StatusModel`/`MessageModel`/`ReturnModel`),
   **`tick_service.py`** (periodic base with graceful shutdown), **`timer.py`**, **`utils.py`**
   (`json_encode/decode`, `sha256_hash`, `generate_random_string`).
+
+## Main Database & Redis
+
+`config["db"]["main"]["driver"]` is `pgsql` (default, absent key) or `sqlite`
+(`{"driver": "sqlite", "database": path, "timeout": 5}`; a relative path resolves against the
+cwd, which is usually `src/`, so use an absolute one). Unknown driver: the bridge refuses to start.
+
+- The SQLite classes are `database_wrapper_sqlite`'s (`SqliteWithPoolingAsync`, `SqliteAsync`,
+  `SqliteConnectionAsync`, `DBWrapperSqliteAsync`; repo `py_database_wrapper`), so a change there
+  needs a database_wrapper release before py_app_runner can pin it.
+- SQLite connections are aiosqlite, opened per `async with pool` (nothing pooled), in autocommit
+  like the Postgres pool's, with `PRAGMA foreign_keys = ON` and WAL. `transaction()` is
+  `BEGIN IMMEDIATE`, nested calls savepoints - a deferred transaction that reads first gets
+  SQLITE_BUSY at its first write without waiting out `busy_timeout`.
+- `@with_db` sets `db_conn`/`db_cur` on either driver, `pg_conn`/`pg_cur` **only on Postgres**,
+  and `db_wrapper` (`DBWrapperSqliteAsync`: `?` placeholders, id from `lastrowid`).
+- `DbPools.main_db_pool` stays annotated as `PgsqlWithPoolingAsync` so existing consumers keep
+  their types; on SQLite it holds a `SqliteWithPoolingAsync`. `cache_db_pool` is `None` without Redis.
+- The JWT user lookup passes the cursor to the project's `UsersModel.get_by_public_id()`, so it
+  works on either driver as long as the model's SQL does.
+- **Postgres-only**, refused on SQLite: `api_key_use_db` (bridge refuses to start), the queue's
+  database driver, audit, and the `api_keys`/`crypto` CLIs - all connect through
+  `migrations._service.connect_kwargs()`, which raises for a non-Postgres config.
+- A table rebuild on SQLite with foreign keys on: `PRAGMA defer_foreign_keys = ON` inside the
+  migration (`PRAGMA foreign_keys` cannot change inside a transaction).
+
+Redis is needed only by WebSocket routes, `@with_cache`/`@with_cache_and_db` and `@rate_limit`.
+"Configured" means `config["db"]["redis"]["hostname"]` is set. Without it there is no cache pool,
+and the cache decorators raise `5000 Cache is not configured`. `WbConnectionManager` (and its
+thread) starts only when a route handler subclasses tornado's `WebSocketHandler`; WebSocket routes
+without Redis refuse startup. `bridge_handler.wb_connection_manager` raises when none was started.
 
 ## Migrations (`migrations/`)
 
@@ -142,6 +175,10 @@ Mixing `targets` with a top-level `dir`/`table` is rejected.
   only when processing more than one.
 - `new`/`repair`/`baseline` require `--target` once more than one exists. Unknown target exits 1.
 - Targets run strictly in sequence, each taking the same advisory lock on its own connection.
+  On SQLite the lock is a `flock` on `<database>.migrations.lock`.
+- SQLite: `config["db"][target.db]["driver"] = "sqlite"`, same commands, same per-file transaction.
+  Files are split with `discovery.split_statements()` (`sqlite3.complete_statement`, so `;` in strings and
+  trigger bodies survive) and run one statement at a time - `executescript()` would COMMIT first.
 - Two targets on one physical database **must not share a tracking table** - refused by
   `resolve_targets`, since each would see the other's rows as `MISSING`.
 - Each file runs in its own transaction, tracking row written inside it. Migrations need not be idempotent.
@@ -303,7 +340,8 @@ python3 src/app.py cron work
 - **Due means "matches this minute"**, evaluated by `cronsim` in the job's zone. There is no
   run history and no catch-up: a minute that was missed is simply missed, exactly as with
   the crontab that calls it. `--job NAME` runs a job now regardless of its schedule.
-- **One Postgres advisory lock per job, held by the scheduler for as long as the child runs.**
+- **One lock per job, held by the scheduler for as long as the child runs** - a Postgres
+  advisory lock, or on a SQLite `db` a `flock` on `<database>.cron-<job>.lock` (`FileLock`).
   A tick that finds the lock taken logs a warning and skips, exit 0 - that is the lock
   working, not a failure. A scheduler that dies drops the lock with its connection but
   leaves the child orphaned, so a job must survive that one overlap. `dry-run` and a tick
@@ -402,8 +440,8 @@ await throttle.clear(f"login:{email}")   # the moment the protected thing succee
 ```python
 @action("verb")           # Register as routable action (MUST be outermost)
 @authenticated            # Require bridge_handler.current_user is not None
-@with_db                  # Inject self.pg_conn, self.pg_cur, self.db_wrapper
-@with_tx                  # PostgreSQL transaction (MUST come after @with_db)
+@with_db                  # Inject self.db_conn, self.db_cur, self.db_wrapper (+ pg_conn/pg_cur on Postgres)
+@with_tx                  # Transaction on db_conn (MUST come after @with_db)
 async def method(self, input_data: dict) -> dict:
 ```
 

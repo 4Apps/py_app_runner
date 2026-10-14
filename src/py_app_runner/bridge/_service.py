@@ -14,14 +14,14 @@ from importlib import import_module
 from typing import Any
 
 import uvloop
-from database_wrapper_pgsql import PgsqlWithPoolingAsync
 from database_wrapper_redis import RedisDbAsync, RedisDbWithPoolAsync
 from tornado import escape, httpserver, netutil, process
 from tornado.platform.asyncio import AsyncIOMainLoop
+from tornado.websocket import WebSocketHandler
 
-from py_app_runner.bridge.web_app import WebApplication
+from py_app_runner.bridge.web_app import RouteDefinition, WebApplication
 from py_app_runner.config import is_env_dev
-from py_app_runner.db_pools import DbPools
+from py_app_runner.db_pools import SQLITE, DbPools, db_driver, make_main_db_pool, redis_configured
 from py_app_runner.pybridge import PyBridge
 from py_app_runner.registry import AppRegistry
 from py_app_runner.request_handler.handlers import WebApplicationBase
@@ -107,33 +107,36 @@ async def child_process_initializer(
     base_logger: logging.Logger,
     sockets: list[socket.socket] | None,
     start_server: ServerStarter,
+    *,
+    websockets: bool = True,
 ) -> None:
     config = AppRegistry.config()
 
     base_logger.info(f"Child starting, task_id={process.task_id()}")
 
     # Init redis
-    redisPool = RedisDbWithPoolAsync(config["db"]["redis"])
+    redisPool = RedisDbWithPoolAsync(config["db"]["redis"]) if redis_configured(config) else None
 
-    # Init postgres
-    pgPool = PgsqlWithPoolingAsync(
-        db_config=config["db"]["main"],
-        instance_name=f"services_bridge_{config['environment']}",
-    )
-    await pgPool.open_pool()
+    # Init the main database
+    mainPool = make_main_db_pool(config["db"]["main"], f"services_bridge_{config['environment']}")
+    await mainPool.open_pool()
 
     # Init database pools
-    dbPools = DbPools(cache_db_pool=redisPool, main_db_pool=pgPool)
+    dbPools = DbPools(cache_db_pool=redisPool, main_db_pool=mainPool)
     application.set_db_pools(dbPools)
 
-    # Init connection manager
-    wb_redis = RedisDbAsync(config["db"]["redis"])
-    cm = WbConnectionManager(cache_db=wb_redis, debug=args.debug_wbcm)
-    # Daemon: a wedged manager must not keep the process alive after the join below
-    # gives up.
-    bg_thread = threading.Thread(target=cm.start_in_new_loop, name="wbcm", daemon=True)
-    bg_thread.start()
-    application.set_wb_connection_manager(cm)
+    # Init connection manager. It only relays to open sockets, so an app without
+    # WebSocket routes has nothing for it to do.
+    cm: WbConnectionManager | None = None
+    bg_thread: threading.Thread | None = None
+    if websockets:
+        wb_redis = RedisDbAsync(config["db"]["redis"])
+        cm = WbConnectionManager(cache_db=wb_redis, debug=args.debug_wbcm)
+        # Daemon: a wedged manager must not keep the process alive after the join below
+        # gives up.
+        bg_thread = threading.Thread(target=cm.start_in_new_loop, name="wbcm", daemon=True)
+        bg_thread.start()
+        application.set_wb_connection_manager(cm)
 
     # Start the server
     try:
@@ -141,18 +144,20 @@ async def child_process_initializer(
         await start_server(application, args, base_logger, sockets)
 
     finally:
-        # Stop processing messages, thus stopping the background thread
-        await cm.stop()
+        if cm is not None and bg_thread is not None:
+            # Stop processing messages, thus stopping the background thread
+            await cm.stop()
 
-        # join() blocks; keep it off the event loop and bounded so a stuck manager
-        # cannot hang the shutdown.
-        await run_blocking(bg_thread.join, 10.0)
-        if bg_thread.is_alive():
-            base_logger.warning("WbConnectionManager thread did not stop in time")
+            # join() blocks; keep it off the event loop and bounded so a stuck manager
+            # cannot hang the shutdown.
+            await run_blocking(bg_thread.join, 10.0)
+            if bg_thread.is_alive():
+                base_logger.warning("WbConnectionManager thread did not stop in time")
 
         # Close the database pools
-        await redisPool.close()
-        await pgPool.close_pool()
+        if redisPool is not None:
+            await redisPool.close()
+        await mainPool.close_pool()
 
         # Remove references
         application.set_db_pools(None)  # type: ignore
@@ -160,6 +165,33 @@ async def child_process_initializer(
         application.set_wb_connection_manager(None)  # type: ignore
 
         base_logger.info("Web service child process stopped")
+
+
+def uses_websockets(routes: list[RouteDefinition] | None) -> bool:
+    return any(
+        isinstance(handler_class, type) and issubclass(handler_class, WebSocketHandler)
+        for _pattern, handler_class, _name in routes or []
+    )
+
+
+def backend_config_error(config: dict[str, Any], websockets: bool) -> str | None:
+    """Why the configured backends cannot run this app, checked before any worker forks."""
+
+    try:
+        driver = db_driver(config["db"]["main"])
+    except ValueError as e:
+        return f'config["db"]["main"]: {e}'
+
+    if websockets and not redis_configured(config):
+        return (
+            "The bridge has WebSocket routes, which relay messages through Redis, but "
+            'config["db"]["redis"] has no hostname.'
+        )
+
+    if driver == SQLITE and AppRegistry.api_key_use_db():
+        return "api_key_use_db needs Postgres: the api_keys table uses text[] and cidr[] columns."
+
+    return None
 
 
 ####################
@@ -232,10 +264,16 @@ async def init_service(
     application = WebApplication(routes=routes, **app_kwargs)
     application.set_pybridge(pybridge)
 
+    websockets = uses_websockets(routes)
+    error = backend_config_error(config, websockets)
+    if error:
+        base_logger.error(error)
+        raise SystemExit(1)
+
     # Dev mode: run single process without forking
     # This is needed to have autoreload working properly
     if is_env_dev(config):
-        await child_process_initializer(application, args, base_logger, None, start_server_dev)
+        await child_process_initializer(application, args, base_logger, None, start_server_dev, websockets=websockets)
         return
 
     # Bind sockets and start processes
@@ -258,7 +296,9 @@ async def init_service(
     if process.task_id() is not None:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
-        asyncio.run(child_process_initializer(application, args, base_logger, sockets, start_server_prod))
+        asyncio.run(
+            child_process_initializer(application, args, base_logger, sockets, start_server_prod, websockets=websockets)
+        )
         return
 
     # Parent: fork_processes only returns here once all children have exited.

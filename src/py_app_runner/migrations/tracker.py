@@ -28,6 +28,19 @@ _COLUMNS_SQL = """
 """
 
 
+def check_columns(table: str, found: set[str]) -> None:
+    missing = EXPECTED_COLUMNS - found
+    if not missing:
+        return
+
+    raise MigrationError(
+        f"Table {table!r} exists but is not a migration tracking table: "
+        f"missing column(s) {', '.join(sorted(missing))}; it has {', '.join(sorted(found)) or 'no columns'}. "
+        f'Point the tracker at a free name via config["migrations"]["table"], '
+        f"or drop/rename the existing table if it is not in use."
+    )
+
+
 class Tracker:
     """Reads and writes the migration tracking table.
 
@@ -72,16 +85,7 @@ class Tracker:
             await cur.execute(_COLUMNS_SQL, (self.table.as_string(self.conn),))
             found = {row[0] for row in await cur.fetchall()}
 
-        missing = EXPECTED_COLUMNS - found
-        if not missing:
-            return
-
-        raise MigrationError(
-            f"Table {self.table_name!r} exists but is not a migration tracking table: "
-            f"missing column(s) {', '.join(sorted(missing))}; it has {', '.join(sorted(found)) or 'no columns'}. "
-            f'Point the tracker at a free name via config["migrations"]["table"], '
-            f"or drop/rename the existing table if it is not in use."
-        )
+        check_columns(self.table_name, found)
 
     async def applied_rows(self) -> list[AppliedRow]:
         statement = sql.SQL("SELECT name, checksum, applied_at FROM {table} ORDER BY name").format(

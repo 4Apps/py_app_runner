@@ -7,7 +7,9 @@ and skips instead of starting a second copy.
 """
 
 import asyncio
+import hashlib
 import logging
+import re
 import signal
 import time
 from collections.abc import Callable, Iterable
@@ -16,6 +18,7 @@ from typing import Protocol
 
 import psycopg
 
+from py_app_runner import file_lock
 from py_app_runner.cron.schedule import Job
 
 # Advisory locks in the two-int form live in their own keyspace, so this cannot collide
@@ -51,6 +54,35 @@ class PgLock:
     async def release(self, name: str) -> None:
         async with self._conn.cursor() as cur:
             await cur.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", (ADVISORY_NAMESPACE, name))
+
+
+class FileLock:
+    """A flock per job beside the SQLite database. Like the advisory lock, it goes with a
+    scheduler that dies, and the orphaned child is not covered by it."""
+
+    def __init__(self, database: str) -> None:
+        self._database = database
+        self._held: dict[str, int] = {}
+
+    def path(self, name: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+        if safe != name:
+            # Two names that differ only in replaced characters must not share a lock.
+            safe += "-" + hashlib.sha256(name.encode()).hexdigest()[:8]
+        return f"{self._database}.cron-{safe}.lock"
+
+    async def acquire(self, name: str) -> bool:
+        fd = file_lock.try_lock(self.path(name))
+        if fd is None:
+            return False
+
+        self._held[name] = fd
+        return True
+
+    async def release(self, name: str) -> None:
+        fd = self._held.pop(name, None)
+        if fd is not None:
+            file_lock.unlock(fd)
 
 
 class LocalLock:

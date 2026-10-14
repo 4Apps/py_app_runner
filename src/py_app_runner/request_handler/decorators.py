@@ -3,9 +3,11 @@ from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import Any, Concatenate, TypeAlias, TypeVar, cast
 
-from database_wrapper_pgsql import DBWrapperPgsqlAsync
+from database_wrapper_redis import RedisDbWithPoolAsync
+from database_wrapper_sqlite import SqliteConnectionAsync
 from typing_extensions import ParamSpec
 
+from py_app_runner.db_pools import make_db_wrapper
 from py_app_runner.http_exception import HTTPException
 from py_app_runner.request_handler.handlers import RequestHandlerHelper
 from py_app_runner.throttle import Throttle
@@ -81,14 +83,41 @@ def require_auth_for_actions(cls: T) -> T:
     return cls
 
 
+_DB_ATTRS = ("db_conn", "db_cur", "pg_conn", "pg_cur", "db_wrapper")
+
+
+def _attach_db(handler: RequestHandlerHelper, conn: Any, cur: Any) -> None:
+    handler.db_conn = conn
+    handler.db_cur = cur
+    if not isinstance(conn, SqliteConnectionAsync):
+        handler.pg_conn = conn
+        handler.pg_cur = cur
+    handler.db_wrapper = make_db_wrapper(conn, cur)  # type: ignore[assignment]
+
+
+def _detach_db(handler: RequestHandlerHelper) -> None:
+    for attr in _DB_ATTRS:
+        if hasattr(handler, attr):
+            delattr(handler, attr)
+
+
+def _cache_pool(bh: Any) -> RedisDbWithPoolAsync:
+    pool = bh.db_pools.cache_db_pool
+    if pool is None:
+        raise HTTPException('Cache is not configured: config["db"]["redis"] has no hostname', 5000)
+
+    return pool
+
+
 def with_tx(func: AsyncMethod) -> AsyncMethod:
     @wraps(func)
     async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
-        pg_conn = getattr(self, "pg_conn", None)
-        if pg_conn is None:
-            raise HTTPException("Database connection not linked (pg_conn missing)", 5000)
+        # pg_conn alone is a handler wired up by hand rather than by @with_db.
+        db_conn = getattr(self, "db_conn", None) or getattr(self, "pg_conn", None)
+        if db_conn is None:
+            raise HTTPException("Database connection not linked (db_conn missing)", 5000)
 
-        async with pg_conn.transaction():
+        async with db_conn.transaction():
             return await func(self, *args, **kwargs)
 
     return wrapper
@@ -101,20 +130,15 @@ def with_db(func: AsyncMethod) -> AsyncMethod:
         if bh is None:
             raise HTTPException("Bridge handler not linked", 5000)
 
-        async with bh.db_pools.main_db_pool as (pg_conn, pg_cur):
-            if not pg_conn or not pg_cur:
+        async with bh.db_pools.main_db_pool as (db_conn, db_cur):
+            if not db_conn or not db_cur:
                 raise HTTPException("Failed to connect to database server", 5000)
 
-            self.pg_conn = pg_conn
-            self.pg_cur = pg_cur
-            self.db_wrapper = DBWrapperPgsqlAsync(pg_cur)
-
+            _attach_db(self, db_conn, db_cur)
             try:
                 return await func(self, *args, **kwargs)
             finally:
-                for attr in ("pg_conn", "pg_cur", "db_wrapper"):
-                    if hasattr(self, attr):
-                        delattr(self, attr)
+                _detach_db(self)
 
     return wrapper
 
@@ -126,7 +150,7 @@ def with_cache(func: AsyncMethod) -> AsyncMethod:
         if bh is None:
             raise HTTPException("Bridge handler not linked", 5000)
 
-        async with bh.db_pools.cache_db_pool as redis_con:
+        async with _cache_pool(bh) as redis_con:
             if not redis_con:
                 raise HTTPException("Failed to connect to cache server", 5000)
 
@@ -147,26 +171,21 @@ def with_cache_and_db(func: AsyncMethod) -> AsyncMethod:
         if bh is None:
             raise HTTPException("Bridge handler not linked", 5000)
 
-        async with bh.db_pools.cache_db_pool as redis_con:
+        async with _cache_pool(bh) as redis_con:
             if not redis_con:
                 raise HTTPException("Failed to connect to cache server", 5000)
 
             self.redis_con = redis_con
             try:
-                async with bh.db_pools.main_db_pool as (pg_conn, pg_cur):
-                    if not pg_conn or not pg_cur:
+                async with bh.db_pools.main_db_pool as (db_conn, db_cur):
+                    if not db_conn or not db_cur:
                         raise HTTPException("Failed to connect to database server", 5000)
 
-                    self.pg_conn = pg_conn
-                    self.pg_cur = pg_cur
-                    self.db_wrapper = DBWrapperPgsqlAsync(pg_cur)
-
+                    _attach_db(self, db_conn, db_cur)
                     try:
                         return await func(self, *args, **kwargs)
                     finally:
-                        for attr in ("pg_conn", "pg_cur", "db_wrapper"):
-                            if hasattr(self, attr):
-                                delattr(self, attr)
+                        _detach_db(self)
             finally:
                 if hasattr(self, "redis_con"):
                     delattr(self, "redis_con")

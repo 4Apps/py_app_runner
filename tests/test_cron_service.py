@@ -7,7 +7,7 @@ import pytest
 
 from py_app_runner.cron._service import app_argv, init_service
 from py_app_runner.cron._service_args import reg_subparsers
-from py_app_runner.cron.execute import PgLock
+from py_app_runner.cron.execute import FileLock, PgLock
 from py_app_runner.registry import AppRegistry
 from tests.migrations_pg import PG_HOST, PG_PASSWORD, PG_PORT, PG_USER, pg_dsn_for
 
@@ -67,6 +67,25 @@ class TestPgLock:
 
                 await first.release("sync")
                 assert await second.acquire("sync")
+
+
+class TestFileLock:
+    async def test_second_holder_cannot_take_a_held_lock(self, tmp_path):
+        database = str(tmp_path / "app.sqlite3")
+        first, second = FileLock(database), FileLock(database)
+
+        assert await first.acquire("sync")
+        assert not await second.acquire("sync")
+        assert await second.acquire("other")
+
+        await first.release("sync")
+        assert await second.acquire("sync")
+
+    def test_names_differing_only_in_unsafe_characters_get_their_own_file(self, tmp_path):
+        lock = FileLock(str(tmp_path / "app.sqlite3"))
+
+        assert lock.path("a/b") != lock.path("a_b")
+        assert lock.path("a/b").startswith(str(tmp_path))
 
 
 class TestInitService:
@@ -139,3 +158,25 @@ class TestInitService:
                 with pytest.raises(SystemExit):
                     await init_service(Namespace(step="run", job="x"), None, logging.getLogger("test"))
                 assert await PgLock(other).acquire("x")
+
+    async def test_run_on_sqlite_takes_a_file_lock(self, saved_registry, tmp_path):
+        database = str(tmp_path / "app.sqlite3")
+        AppRegistry.configure(
+            config={
+                "db": {"main": {"driver": "sqlite", "database": database}},
+                "cron": {"jobs": {"x": {"schedule": "0 4 * * *", "command": "--version"}}},
+            },
+            users_model=object,
+            api_keys_model=object,
+        )
+
+        other = FileLock(database)
+        assert await other.acquire("x")
+        with pytest.raises(SystemExit) as excinfo:
+            await init_service(Namespace(step="run", job="x"), None, logging.getLogger("test"))
+        assert excinfo.value.code == 0  # skipped, not failed
+        await other.release("x")
+
+        with pytest.raises(SystemExit):
+            await init_service(Namespace(step="run", job="x"), None, logging.getLogger("test"))
+        assert await other.acquire("x")

@@ -9,6 +9,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from database_wrapper_pgsql import DBWrapperPgsqlAsync, PgConnectionTypeAsync, PgCursorTypeAsync
+from database_wrapper_sqlite import SqliteConnectionAsync, SqliteTypedDictCursorAsync
 from redis.asyncio import Redis as RedisClientAsync
 from tornado import httputil, web
 
@@ -98,7 +99,10 @@ class RequestHandlerBase(web.RequestHandler):
 
     @property
     def wb_connection_manager(self) -> WbConnectionManager:
-        return self.application.wb_connection_manager
+        cm = getattr(self.application, "wb_connection_manager", None)
+        if cm is None:
+            raise RuntimeError("No WbConnectionManager: the bridge starts one only when it has WebSocket routes")
+        return cm
 
     @property
     def context(self) -> RequestParams:
@@ -665,6 +669,9 @@ class RequestHandlerHelper:
 
     bridge_handler: RequestHandlerBase
 
+    # Set by @with_db on either driver; pg_conn/pg_cur only on Postgres.
+    db_conn: PgConnectionTypeAsync | SqliteConnectionAsync
+    db_cur: PgCursorTypeAsync | SqliteTypedDictCursorAsync
     pg_conn: PgConnectionTypeAsync
     pg_cur: PgCursorTypeAsync
     db_wrapper: DBWrapperPgsqlAsync

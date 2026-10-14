@@ -23,6 +23,27 @@ pip install py_app_runner==0.4.50.dev0 # a specific dev build
 docker-compose up develop
 ```
 
+## Databases
+
+The main database is Postgres unless `config["db"]["main"]` says otherwise:
+
+```python
+"db": {
+    "main": {"driver": "sqlite", "database": "/srv/app/data/app.sqlite3"},
+    "redis": {},   # no hostname: no Redis
+}
+```
+
+On SQLite, `@with_db` hands out the same `(conn, cur)` pair from an aiosqlite connection
+(foreign keys on, WAL), `@with_tx` opens `BEGIN IMMEDIATE`, `self.db_wrapper` takes `?`
+placeholders, and `migrations` and `cron` lock with `flock` on files beside the database.
+The queue's database driver, audit, `api_key_use_db` and the `api_keys`/`crypto` CLIs stay
+Postgres-only and refuse a SQLite database.
+
+Redis is needed only for WebSocket routes, `@with_cache` and `@rate_limit`. Without a
+`config["db"]["redis"]["hostname"]` the bridge starts no cache pool, and no WebSocket
+connection manager unless it has WebSocket routes, in which case it refuses to start.
+
 ## Migrations
 
 Built-in service that applies tracked SQL files to one or more configured databases. Add
@@ -114,8 +135,8 @@ python3 src/app.py cron work                       # the same, looping, for a co
 ```
 
 Each job runs as its own `app.py` process, so a wedged or leaking job takes only itself
-down and `timeout` can kill it. A Postgres advisory lock per job stops a tick from starting
-a second copy of one still running. There is no run history and no catch-up: a job is due
+down and `timeout` can kill it. A lock per job (a Postgres advisory lock, or a `flock` on
+SQLite) stops a tick from starting a second copy of one still running. There is no run history and no catch-up: a job is due
 when its expression matches the current minute, and a missed minute is missed.
 
 ## API keys

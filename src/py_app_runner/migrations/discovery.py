@@ -1,6 +1,7 @@
 import hashlib
 import pathlib
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -106,3 +107,30 @@ def new_filename(name: str, now: datetime) -> str:
         raise MigrationError(f"Migration name {name!r} contains no usable characters")
 
     return f"{now:%Y-%m-%d-%H%M%S}-{slug}.sql"
+
+
+def split_statements(script: str) -> list[str]:
+    """Split a script into single statements, for a caller that needs them inside its own
+    transaction. `executescript()` would do it too, but commits whatever is open first.
+
+    Cut at every `;` that ends a complete statement, so one inside a string literal or a
+    CREATE TRIGGER body stays where it is."""
+
+    statements: list[str] = []
+    buffer = ""
+    for part in script.split(";"):
+        buffer += part + ";"
+        if sqlite3.complete_statement(buffer):
+            statements.append(buffer.strip())
+            buffer = ""
+
+    # Without the `;` the loop added, a remainder is only comments, or an incomplete
+    # statement that is passed on for SQLite to reject rather than dropped.
+    statements.append(buffer[:-1].strip())
+
+    return [statement for statement in statements if _has_code(statement)]
+
+
+def _has_code(statement: str) -> bool:
+    lines = (line.split("--", 1)[0].strip() for line in statement.splitlines())
+    return any(line and line != ";" for line in lines)

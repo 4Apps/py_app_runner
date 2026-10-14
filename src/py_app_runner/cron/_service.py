@@ -1,17 +1,20 @@
 import asyncio
+import contextlib
 import datetime
 import logging
 import os
 import signal
 import sys
 from argparse import Namespace
+from collections.abc import AsyncIterator
 from typing import Any
 
 import psycopg
 
 from py_app_runner.cron.commands import Out, cmd_list, cmd_run, cmd_work, select_due
-from py_app_runner.cron.execute import Executor, LocalLock, Lock, PgLock, install_shutdown_handlers
+from py_app_runner.cron.execute import Executor, FileLock, LocalLock, Lock, PgLock, install_shutdown_handlers
 from py_app_runner.cron.schedule import CronError, Job, current_minute, load_jobs, settings
+from py_app_runner.db_pools import SQLITE, db_driver
 from py_app_runner.migrations._service import connect_kwargs
 from py_app_runner.pybridge import PyBridge
 from py_app_runner.registry import AppRegistry
@@ -54,8 +57,8 @@ async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Log
             # Neither path starts a process, so no lock and no database connection.
             raise SystemExit(await cmd_run(due, _executor(args, LocalLock(), logger), True, logger, out))
 
-        async with await psycopg.AsyncConnection.connect(**connect_kwargs(_db_config(conf, config, out))) as conn:
-            executor = _executor(args, PgLock(conn), logger)
+        async with _job_lock(_db_config(conf, config, out)) as lock:
+            executor = _executor(args, lock, logger)
             install_shutdown_handlers(executor, logger)
             code = await cmd_run(due, executor, False, logger, out)
 
@@ -82,7 +85,23 @@ def _db_config(conf: dict[str, Any], config: dict[str, Any], out: Out) -> dict[s
         )
         raise SystemExit(2)
 
+    try:
+        db_driver(db_config[db_name])
+    except ValueError as e:
+        out(f"error: {e}")
+        raise SystemExit(2) from None
+
     return db_config[db_name]
+
+
+@contextlib.asynccontextmanager
+async def _job_lock(db_config: dict[str, Any]) -> AsyncIterator[Lock]:
+    if db_driver(db_config) == SQLITE:
+        yield FileLock(str(db_config["database"]))
+        return
+
+    async with await psycopg.AsyncConnection.connect(**connect_kwargs(db_config)) as conn:
+        yield PgLock(conn)
 
 
 def _executor(args: Namespace, lock: Lock, logger: logging.Logger) -> Executor:

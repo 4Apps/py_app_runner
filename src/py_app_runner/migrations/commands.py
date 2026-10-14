@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 import psycopg
+from database_wrapper_sqlite import SqliteConnectionAsync
 
 from py_app_runner.migrations.discovery import (
     MigrationError,
@@ -12,17 +13,46 @@ from py_app_runner.migrations.discovery import (
     find_meta_commands,
     load_migration,
     new_filename,
+    split_statements,
 )
 from py_app_runner.migrations.states import MigrationState, State, blocking, compute_states, pending
 from py_app_runner.migrations.tracker import Tracker
+from py_app_runner.migrations.tracker_sqlite import SqliteTracker
 
 Out = Callable[[str], None]
+Connection = psycopg.AsyncConnection | SqliteConnectionAsync
+
+
+def _make_tracker(conn: Connection, table: str) -> Tracker | SqliteTracker:
+    if isinstance(conn, SqliteConnectionAsync):
+        return SqliteTracker(conn, table)
+
+    return Tracker(conn, table)
+
+
+def _autocommit(conn: Connection) -> bool:
+    if isinstance(conn, SqliteConnectionAsync):
+        return conn.raw.isolation_level is None
+
+    return conn.autocommit
+
+
+async def _execute(conn: Connection, sql: str) -> None:
+    if isinstance(conn, SqliteConnectionAsync):
+        # One statement per call: sqlite3 refuses more, and executescript() would commit
+        # the transaction this runs in.
+        for statement in split_statements(sql):
+            await conn.execute(statement)
+        return
+
+    async with conn.cursor() as cur:
+        await cur.execute(sql.encode(conn.info.encoding))
 
 
 async def _load_states(
-    conn: psycopg.AsyncConnection, directory: pathlib.Path, table: str
-) -> tuple[Tracker, list[MigrationState]]:
-    tracker = Tracker(conn, table)
+    conn: Connection, directory: pathlib.Path, table: str
+) -> tuple[Tracker | SqliteTracker, list[MigrationState]]:
+    tracker = _make_tracker(conn, table)
     await tracker.ensure_table()
     files = discover(directory)
     rows = await tracker.applied_rows()
@@ -56,7 +86,7 @@ def _report_blocking(states: list[MigrationState], table: str, out: Out) -> None
 
 
 async def cmd_status(
-    conn: psycopg.AsyncConnection,
+    conn: Connection,
     directory: pathlib.Path,
     table: str,
     check: bool,
@@ -89,7 +119,7 @@ async def cmd_status(
 
 
 async def cmd_apply(
-    conn: psycopg.AsyncConnection,
+    conn: Connection,
     directory: pathlib.Path,
     table: str,
     dry_run: bool,
@@ -107,11 +137,11 @@ async def cmd_apply(
     also requires autocommit outright.
     """
 
-    if not conn.autocommit:
+    if not _autocommit(conn):
         out("error: cmd_apply requires an autocommit connection")
         return 1
 
-    tracker = Tracker(conn, table)
+    tracker = _make_tracker(conn, table)
 
     async with tracker.lock():
         try:
@@ -172,8 +202,7 @@ async def cmd_apply(
             duration_ms = 0
             try:
                 if state.file.no_transaction:
-                    async with conn.cursor() as cur:
-                        await cur.execute(state.file.sql.encode(conn.info.encoding))
+                    await _execute(conn, state.file.sql)
 
                     duration_ms = int((time.monotonic() - started) * 1000)
                     await tracker.record(state.name, state.file.checksum, duration_ms, applied_by)
@@ -181,8 +210,7 @@ async def cmd_apply(
                     # The tracking row is written inside the same transaction as the
                     # migration, so a file either fully lands and is recorded, or neither.
                     async with conn.transaction():
-                        async with conn.cursor() as cur:
-                            await cur.execute(state.file.sql.encode(conn.info.encoding))
+                        await _execute(conn, state.file.sql)
 
                         duration_ms = int((time.monotonic() - started) * 1000)
                         await tracker.record(state.name, state.file.checksum, duration_ms, applied_by)
@@ -224,7 +252,7 @@ _NEW_FILE_TEMPLATE = """-- {name}
 
 
 async def cmd_baseline(
-    conn: psycopg.AsyncConnection,
+    conn: Connection,
     directory: pathlib.Path,
     table: str,
     to: str | None,
@@ -243,11 +271,11 @@ async def cmd_baseline(
     caller never commits, rather than genuinely "written".
     """
 
-    if not conn.autocommit:
+    if not _autocommit(conn):
         out("error: cmd_baseline requires an autocommit connection")
         return 1
 
-    tracker = Tracker(conn, table)
+    tracker = _make_tracker(conn, table)
 
     async with tracker.lock():
         try:
@@ -335,7 +363,7 @@ def cmd_new(directory: pathlib.Path, name: str, now: datetime, out: Out) -> int:
 
 
 async def cmd_repair(
-    conn: psycopg.AsyncConnection,
+    conn: Connection,
     directory: pathlib.Path,
     table: str,
     name: str,
@@ -348,7 +376,7 @@ async def cmd_repair(
     is a single UPDATE with no explicit commit of its own.
     """
 
-    if not conn.autocommit:
+    if not _autocommit(conn):
         out("error: cmd_repair requires an autocommit connection")
         return 1
 
@@ -370,7 +398,7 @@ async def cmd_repair(
         out(f"error: {e}")
         return 1
 
-    tracker = Tracker(conn, table)
+    tracker = _make_tracker(conn, table)
     try:
         await tracker.ensure_table()
     except MigrationError as e:
