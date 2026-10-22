@@ -232,7 +232,7 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         origin_host = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else normalized
         return origin_host in allowed
 
-    async def open(self, *args: str, **kwargs: str) -> None:
+    async def open(self, *args: str, **kwargs: str) -> None:  # pyrefly: ignore[bad-override-mutable-attribute]
         # Cache the connection
         self.uid = str(uuid.uuid4())
         self.wb_connection_manager.user_connections.add_connection(self)
