@@ -68,6 +68,7 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         self._rejected_api_key: str | None = None
         self._api_key_checked_at = 0.0
         self._api_key_user_cache: Any = _UNSET
+        self._auth_lookup_failed = False
 
         super().__init__(*args, **kwargs)
 
@@ -197,10 +198,19 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
     ########################
 
     async def reload_token(self, new_auth_token: str) -> None:
-        old_auth_token = self.auth_token
-        if old_auth_token != new_auth_token:
-            self.auth_token = new_auth_token
+        if new_auth_token == self.auth_token and not self._auth_lookup_failed:
+            return
+
+        self.auth_token = new_auth_token
+        try:
             await self._ensure_current_user()
+        except BaseException:
+            # A lookup that failed (as opposed to refused the token) is retried on the next
+            # message; until then the socket is nobody, not the previous token's user.
+            self._clear_current_user()
+            self._auth_lookup_failed = True
+            raise
+        self._auth_lookup_failed = False
 
     def check_origin(self, origin: str) -> bool:
         allowed = allowed_ws_origins()

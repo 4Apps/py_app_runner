@@ -544,6 +544,7 @@ class RequestHandlerApiKeys(RequestHandlerBase):
         """The user an API key acts as, or None if it must not act as them.
 
         Override to apply the same checks the application's own authentication applies.
+        Raise when the lookup itself fails: None refuses the request as unauthenticated.
         """
         UsersModel = AppRegistry.users_model()
         async with self.db_pools.main_db_pool as (pg_conn, pg_cur):
