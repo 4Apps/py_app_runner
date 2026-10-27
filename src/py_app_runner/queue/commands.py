@@ -9,6 +9,7 @@ from typing import Any
 import psycopg
 
 from py_app_runner.migrations.discovery import MigrationError, new_filename
+from py_app_runner.queue.driver_pg import assert_table_name
 from py_app_runner.queue.interface import QueueDriver
 from py_app_runner.queue.job import QueueError
 
@@ -27,6 +28,13 @@ def cmd_install(
     out: Out,
 ) -> int:
     """Write the queue schema into the project's own migrations directory."""
+
+    try:
+        assert_table_name(table)
+        assert_table_name(failed_table)
+    except QueueError as e:
+        out(f"error: {e}")
+        return 2
 
     if not migrations_dir.is_dir():
         out(f"error: no migrations directory at {migrations_dir}")

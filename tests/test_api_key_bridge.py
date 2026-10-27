@@ -157,3 +157,15 @@ async def test_websocket_scopes_every_message_and_notices_revocation():
         assert (await ws_call(conn, 6, "reports", "run"))["error"]["code"] == 1401
 
         conn.close()
+
+
+async def test_websocket_revocation_reaches_key_can_in_services_not_requiring_a_key():
+    async with live_bridge("par_test_key_ws_open") as bridge:
+        conn = await bridge.ws(await bridge.add_key(["reports:export"]))
+
+        assert (await ws_call(conn, 1, "public", "anything"))["can_export"] is True
+
+        await bridge.conn.execute("UPDATE api_keys SET disabled_at = now()")
+        assert (await ws_call(conn, 2, "public", "anything"))["can_export"] is False
+
+        conn.close()

@@ -9,6 +9,7 @@ a column nobody touched, which is how an audit log becomes something nobody open
 
 import datetime
 import json
+from collections.abc import Collection
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -137,7 +138,7 @@ def _json(value: Any) -> str:
         return str(value)
 
 
-def mask(values: dict[str, Any], exclude: list[str]) -> dict[str, Any]:
+def mask(values: dict[str, Any], exclude: Collection[str]) -> dict[str, Any]:
     """Replace excluded values while keeping their keys.
 
     The key stays so the trail still shows that a password changed; only the value is
@@ -147,7 +148,8 @@ def mask(values: dict[str, Any], exclude: list[str]) -> dict[str, Any]:
     if not exclude:
         return values
 
-    return {key: (REDACTED if key in exclude else value) for key, value in values.items()}
+    excluded = {column.lower() for column in exclude}
+    return {key: (REDACTED if key.lower() in excluded else value) for key, value in values.items()}
 
 
 def between(
@@ -161,7 +163,7 @@ def between(
     update reporting only differences, and (None, None) nothing.
     """
 
-    excluded = exclude or []
+    excluded = {column.lower() for column in exclude or []}
 
     if before is None and after is None:
         return (None, None)
@@ -186,7 +188,7 @@ def between(
         if same(old_value, new_value):
             continue
 
-        if key in excluded:
+        if key.lower() in excluded:
             old_values[key] = REDACTED
             new_values[key] = REDACTED
             continue

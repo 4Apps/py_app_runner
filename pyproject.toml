@@ -43,13 +43,17 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+# Floors only, plus a cap where a breaking major is known: an upper bound here binds every
+# project installing this package.
 dependencies = [
-    "sentry-sdk",
-    "python-dotenv",
-    "uvloop",
-    "msgspec",
-    "msgpack",
-    "tornado",
+    # Floors exclude releases with published security advisories, lacking Python 3.13 wheels
+    # (uvloop, msgspec) or lacking an API used here (sentry-sdk get_isolation_scope)
+    "sentry-sdk >= 2.12.0, < 3",
+    "python-dotenv >= 1.2.2",
+    "uvloop >= 0.21.0",
+    "msgspec >= 0.19.0",
+    "msgpack >= 1.2.4",
+    "tornado >= 6.5.9",
     # The extras pull the base package in, so one pin rather than three that must be kept
     # in lockstep. 0.3.146 is the first MIT release - 0.2.38 and earlier are GPL-3.0.
     "database_wrapper[pgsql,redis,sqlite] == 0.3.147",
@@ -58,31 +62,31 @@ dependencies = [
     # own psycopg[binary]/psycopg[pool] >= 3.2.0.
     "psycopg >= 3.2.0",
     "psycopg[pool] >= 3.2.0",
-    "redis",
-    "pyjwt",
+    "redis >= 4.5.4",
+    "pyjwt >= 2.15.0",
 ]
 
 # A service that is not in SERVICES is never imported, so its library need not be installed.
 # The import site raises a message naming the extra when it is missing.
 [project.optional-dependencies]
 crypto = [
-    # AES-256-GCM. The floor is 44 because that is where XChaCha20Poly1305 appears, which
-    # is the obvious alternative if AES-GCM's 96-bit nonce ever becomes uncomfortable for
-    # a high-volume column.
-    "cryptography >= 44",
-    "bcrypt",
+    # AES-256-GCM. 44 added XChaCha20Poly1305, the obvious alternative if AES-GCM's 96-bit
+    # nonce ever becomes uncomfortable; 50.0.0 excludes releases with published advisories.
+    "cryptography >= 50.0.0",
+    "bcrypt >= 4.2.0",
 ]
 cron = [
     # Cron expression matching. Zero dependencies, DST-aware.
-    "cronsim",
+    "cronsim >= 2.6",
 ]
 all = ["py_app_runner[crypto,cron]"]
+# Minor-pinned: a new ruff or pyrefly minor changes what fails the build
 dev = [
     "py_app_runner[all]",
-    "pyrefly",
-    "ruff",
-    "pytest",
-    "pytest-asyncio",
+    "pyrefly == 1.4.*",
+    "ruff == 0.17.*",
+    "pytest == 9.1.*",
+    "pytest-asyncio == 1.4.*",
 ]
 
 [project.urls]

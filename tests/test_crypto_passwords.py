@@ -45,6 +45,9 @@ class TestMalformedInput:
             hasher.hash("x" * 73)
         assert "72 bytes" in str(excinfo.value)
 
+    def test_verifying_a_password_past_the_limit_is_false_rather_than_raising(self):
+        assert hasher.verify("x" * 73, hasher.hash("x" * 72)) is False
+
 
 class TestNeedsRehash:
     def test_false_for_a_hash_at_the_configured_cost(self):

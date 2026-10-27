@@ -21,6 +21,8 @@ from .utils import is_sensitive_key
 
 # Constants
 ERROR_RATE = 60  # Minute
+# SequenceMatcher is quadratic and events carry client input, so only a prefix is compared.
+SIMILARITY_CHARS = 1024
 
 
 # Types
@@ -51,7 +53,7 @@ def RateControl(event: Event, hint: Hint) -> Event | None:
         return None
 
     now = int(time.time())
-    current_event = str(event)
+    current_event = str(event)[:SIMILARITY_CHARS]
     test = SequenceMatcher(None, last_error["msg"], current_event).ratio()
     if last_error["time"] == 0 or now - int(last_error["time"]) >= ERROR_RATE or test < 0.4:
         sys.stderr.write("#### Allowing Sentry to send error message\n")
@@ -116,6 +118,14 @@ class SensitiveKeyScrubber(EventScrubber):
     Nested containers are scrubbed as copies - extras and breadcrumb data hold live references
     into the application's own objects.
     """
+
+    def scrub_request(self, event: Event) -> None:
+        super().scrub_request(event)
+
+        # The stock scrubber only descends into a dict, and a JSON array body is a list.
+        request = event.get("request")
+        if isinstance(request, dict) and isinstance(request.get("data"), list):
+            request["data"] = self._scrubbed_copy(request["data"])
 
     def scrub_dict(self, d: object) -> None:
         if not isinstance(d, dict):

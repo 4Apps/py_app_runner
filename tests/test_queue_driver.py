@@ -6,6 +6,7 @@ import psycopg
 import pytest
 import pytest_asyncio
 
+from py_app_runner.queue.commands import cmd_install
 from py_app_runner.queue.driver_pg import PgQueue, fit_error
 from py_app_runner.queue.job import QueueError
 from tests.migrations_pg import pg_dsn_for
@@ -316,3 +317,14 @@ class TestTableGuard:
     async def test_refuses_a_table_name_that_is_not_a_plain_identifier(self, conn):
         with pytest.raises(QueueError):
             PgQueue(conn, table="queue_jobs; DROP TABLE queue_jobs")
+
+    def test_install_refuses_a_table_name_that_is_not_a_plain_identifier(self, tmp_path):
+        """The names are pasted into the schema it writes, which then runs as a migration."""
+
+        lines: list[str] = []
+        code = cmd_install(
+            tmp_path, "queue_jobs", "x (id int); DROP TABLE users; --", datetime.datetime(2026, 8, 2), lines.append
+        )
+
+        assert code == 2
+        assert list(tmp_path.iterdir()) == []

@@ -29,16 +29,16 @@ class PasswordHasher:
         return bcrypt.hashpw(self._encode(password), bcrypt.gensalt(self.rounds)).decode("ascii")
 
     def verify(self, password: str, stored: str) -> bool:
-        """False for a wrong password *and* for a malformed hash.
+        """False for a wrong password, a malformed hash, and a password past bcrypt's limit.
 
-        A stored value that is not a bcrypt hash at all - a truncated column, a migration
-        that put something else there - must not raise out of a login handler, because the
-        answer to "may this person in" is still no.
+        None of these may raise out of a login handler, because the answer to "may this
+        person in" is still no. A too-long password matches no hash this class made, since
+        `hash` refuses it.
         """
 
         try:
             return bcrypt.checkpw(self._encode(password), stored.encode("utf-8"))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, CryptoError):
             return False
 
     def needs_rehash(self, stored: str) -> bool:

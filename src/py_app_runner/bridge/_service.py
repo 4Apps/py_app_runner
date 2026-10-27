@@ -34,6 +34,12 @@ ServerStarter = Callable[
 ]
 
 
+def max_body_size(app: WebApplicationBase) -> int:
+    # Tornado buffers a whole body before any handler code runs, and its own default is
+    # 100 MB; this matches its 10 MiB websocket_max_message_size instead.
+    return app.settings.get("max_body_size") or 10 * 1024 * 1024
+
+
 async def start_server_dev(
     app: WebApplicationBase,
     args: Namespace,
@@ -46,7 +52,7 @@ async def start_server_dev(
     autoreload.start()
 
     # Start the server
-    server = httpserver.HTTPServer(app, xheaders=True, max_body_size=app.settings.get("max_body_size"))
+    server = httpserver.HTTPServer(app, xheaders=True, max_body_size=max_body_size(app))
     server.listen(args.port, address=args.address)  # no fork, no reuse_port
 
     # Graceful shutdown on SIGINT/SIGTERM
@@ -82,7 +88,7 @@ async def start_server_prod(
     app.settings.update(autoreload=False)
 
     # Start the server
-    server = httpserver.HTTPServer(app, xheaders=True, max_body_size=app.settings.get("max_body_size"))
+    server = httpserver.HTTPServer(app, xheaders=True, max_body_size=max_body_size(app))
     server.add_sockets(sockets)
 
     # Graceful shutdown on SIGINT/SIGTERM

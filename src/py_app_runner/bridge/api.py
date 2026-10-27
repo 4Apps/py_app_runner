@@ -94,7 +94,7 @@ class ApiHandler(WebHandlerBase):
             res = self.find_service(service_name=service)
             if not res.result:
                 raise HTTPException(
-                    f"Could not find service by provided name: {service}",
+                    f"Could not find service by provided name: {str(service)[:100]}",
                     code=1002,
                     http_status=400,
                 )

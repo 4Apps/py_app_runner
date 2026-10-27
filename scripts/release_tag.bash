@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Create the release tag for the current commit: v<.version>.<commit count>.
+# Create the release tag for the current commit: v<.version>.<next patch of that minor>.
 #
 # Nothing is published by this script, and nothing is published by pushing the tag either.
 # The tag only marks the commit; publishing happens when a GitHub *release* is created from
@@ -39,24 +39,25 @@ if [ -n "$(git -C "$BASE_PATH" status --porcelain)" ]; then
 fi
 
 if git -C "$BASE_PATH" rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-    echo "error: ${TAG} already exists." >&2
-    echo "       The commit count has not moved since the last release, so there is" >&2
-    echo "       nothing new to tag. Commit first." >&2
+    echo "error: ${TAG} already exists - this commit is already released." >&2
     exit 1
 fi
 
-# The patch number is the commit count, which only ever grows on a branch that is added
-# to - but a rebase, a squash or a reset can shorten history and hand back a version below
-# one already published. PyPI would keep serving the older, higher version as latest, and
-# the lower one can never be withdrawn and re-uploaded.
+# The release body is the changelog section, so a tag without one would publish blank notes
+if ! "${THIS_DIR}/changelog.bash" notes "$TAG" >/dev/null; then
+    echo "       Run scripts/changelog.bash prepare, commit CHANGELOG.md, then tag." >&2
+    exit 1
+fi
+
+# .version set below a minor that was already released would publish a version PyPI keeps
+# ranking under the older, higher one - and it can never be withdrawn and re-uploaded.
 LATEST_TAG="$(git -C "$BASE_PATH" tag -l 'v*' | sort -V | tail -1)"
 if [ -n "$LATEST_TAG" ]; then
     HIGHEST="$(printf '%s\n%s\n' "$LATEST_TAG" "$TAG" | sort -V | tail -1)"
     if [ "$HIGHEST" != "$TAG" ]; then
         echo "error: ${TAG} sorts below the existing ${LATEST_TAG}." >&2
-        echo "       History was probably rewritten, so the commit count went backwards." >&2
-        echo "       Bump the minor in .version rather than publishing a version that" >&2
-        echo "       pip will never resolve as the newest." >&2
+        echo "       .version is behind a released minor; bump it rather than publishing" >&2
+        echo "       a version that pip will never resolve as the newest." >&2
         exit 1
     fi
 fi
@@ -90,5 +91,5 @@ echo
 echo "Pushing publishes nothing. Then create the GitHub release from the tag, which is"
 echo "what uploads ${VERSION} to PyPI:"
 echo
-echo "    gh release create ${TAG} --title ${TAG} --generate-notes"
+echo "    scripts/changelog.bash notes ${TAG} | gh release create ${TAG} --title ${TAG} --notes-file -"
 echo

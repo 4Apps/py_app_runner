@@ -108,6 +108,59 @@ class TestApply:
         assert "a" not in await tables(conn)
 
 
+class TestForeignKeysOff:
+    """DROP TABLE on SQLite deletes the rows first, so rebuilding a parent with enforcement on
+    cascades into every child."""
+
+    SCHEMA = (
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);\n"
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent (id) ON DELETE CASCADE);\n"
+        "INSERT INTO parent VALUES (1, 'a');\n"
+        "INSERT INTO child VALUES (1, 1);\n"
+    )
+
+    @staticmethod
+    def rebuild(copy_rows: str) -> str:
+        return (
+            "-- migrations:foreign-keys-off\n"
+            "CREATE TABLE parent_new (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n"
+            f"{copy_rows}"
+            "DROP TABLE parent;\n"
+            "ALTER TABLE parent_new RENAME TO parent;\n"
+        )
+
+    async def test_a_parent_rebuild_keeps_the_cascading_children(self, conn, migrations_dir, printed):
+        _lines, out = printed
+        (migrations_dir / "2026-08-04-091530-schema.sql").write_text(self.SCHEMA)
+        (migrations_dir / "2026-08-04-091531-rebuild.sql").write_text(
+            self.rebuild("INSERT INTO parent_new SELECT id, name FROM parent;\n")
+        )
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 0
+
+        cur = await conn.execute("SELECT count(*) AS n FROM child")
+        assert (await cur.fetchone())["n"] == 1
+        cur = await conn.execute("PRAGMA foreign_keys")
+        assert (await cur.fetchone())["foreign_keys"] == 1
+
+    async def test_a_rebuild_leaving_a_dangling_reference_fails_and_records_nothing(
+        self, conn, migrations_dir, printed
+    ):
+        lines, out = printed
+        (migrations_dir / "2026-08-04-091530-schema.sql").write_text(self.SCHEMA)
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 0
+        (migrations_dir / "2026-08-04-091531-rebuild.sql").write_text(self.rebuild(""))
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+
+        assert any("foreign key check failed: child rowid 1 -> parent" in line for line in lines)
+        assert await tracked(conn) == ["2026-08-04-091530-schema.sql"]
+        cur = await conn.execute("SELECT count(*) AS n FROM parent")
+        assert (await cur.fetchone())["n"] == 1
+        cur = await conn.execute("PRAGMA foreign_keys")
+        assert (await cur.fetchone())["foreign_keys"] == 1
+
+
 class TestTracker:
     async def test_drift_then_repair(self, conn, migrations_dir, printed):
         lines, out = printed
@@ -129,6 +182,17 @@ class TestTracker:
         assert await cmd_baseline(conn, migrations_dir, "migrations", None, True, "test", input, out) == 0
         assert await tracked(conn) == ["2026-08-04-091530-a.sql"]
         assert "a" not in await tables(conn)
+
+    async def test_missing_advice_quotes_the_tracked_name(self, conn, migrations_dir, printed):
+        lines, out = printed
+        await cmd_status(conn, migrations_dir, "migrations", check=False, out=out)
+        await conn.execute(
+            "INSERT INTO migrations (name, checksum, duration_ms, applied_by) VALUES (?, 'x', 0, 'test')",
+            ("2026-08-04-091530-o'brien.sql",),
+        )
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+        assert any("DELETE FROM migrations WHERE name = '2026-08-04-091530-o''brien.sql';" in line for line in lines)
 
     async def test_refuses_an_unrelated_table_of_the_same_name(self, conn, migrations_dir, printed):
         lines, out = printed

@@ -21,27 +21,43 @@ pyrefly check ./src/
 Postgres and Redis are test dependencies, not runtime ones. An unreachable server is a test
 **failure**, not a skip; `ALLOW_PG_SKIP` / `ALLOW_REDIS_SKIP` opt into skipping on a bare checkout.
 
+`pyproject.toml` holds floors for runtime dependencies (a cap only for a known breaking major -
+an upper bound there binds every downstream project) and minor pins for dev tools. Nothing pins
+the rest, so CI and a fresh image test the newest releases; rebuild the image to match CI.
+
+## Changelog
+
+Every user-visible change adds one line under `## Unreleased` in `CHANGELOG.md`, in the same
+change. One line each - no paragraphs, no file lists, no rationale; that belongs in the commit
+message. Prefix `**Breaking:**` when a downstream project must act. Refactors and tests get none.
+
 ## Versioning & Release
 
 `major.minor` is manual in `.version` (read by `pyproject.toml` via
-`[tool.setuptools.dynamic]`); the patch part is the git commit count, appended by CI.
+`[tool.setuptools.dynamic]`). The patch counts releases within that minor (`0.7.0`, `0.7.1`, ...)
+and is read off the `v<major.minor>.<patch>` tags - never stored, never bumped by hand.
 
-- `scripts/version.bash` — prints `<major.minor>.<git rev-list --count HEAD>`; `--dev` appends
-  `.dev0`. Publish workflows write it into `.version` before building, workspace-only. Needs
-  `fetch-depth: 0`; refuses a shallow clone.
-- `scripts/bump_version.bash [major|minor]` — bumps and stages `.version`. Never bump the patch by hand.
-- `scripts/release_tag.bash` — creates `v<version>`, publishes nothing; refuses a tag sorting
-  below the newest existing one (remedy: bump the minor).
+- `scripts/version.bash` — a commit carrying a release tag of the current minor prints that
+  version, any other commit the next patch. `--dev` prints `<next patch>.dev<N>`, N = commits
+  since the newest release tag. Publish workflows write it into `.version` before building,
+  workspace-only. Needs tags and full history (`fetch-depth: 0`); refuses a shallow clone.
+- `scripts/bump_version.bash [major|minor]` — bumps and stages `.version`; the new minor's first
+  release is `.0`.
+- `scripts/changelog.bash prepare` — renames `## Unreleased` to the next version, dated; commit
+  it before tagging. `notes TAG` prints that section, which becomes the GitHub release body.
+- `scripts/release_tag.bash` — creates `v<version>`, publishes nothing; refuses a commit already
+  released, a version without a changelog section, and a tag sorting below the newest existing
+  one (remedy: bump the minor).
 - `py_app_runner.__version__` comes from installed package metadata.
 
-**A PyPI version can never be replaced or re-uploaded**, and a rebase/squash/reset shortens
-history into an already-published version. For that reason, **merge develop into master with
-`--no-ff`**. Skipped commits leave harmless gaps in the sequence.
+**A PyPI version can never be replaced or re-uploaded.** Release numbers come from tags, so a
+rebase, squash or merge commit cannot shift them. A dev number can repeat after develop is reset;
+`skip-existing` then skips that upload.
 
 | Trigger | Version | pip resolves it |
 | --- | --- | --- |
-| push to `develop` | `0.4.50.dev0` | only with `--pre`, or an exact pin |
-| GitHub release on `v0.4.52` | `0.4.52` | as "latest" |
+| push to `develop` | `0.7.1.dev4` | only with `--pre`, or an exact pin |
+| GitHub release on `v0.7.1` | `0.7.1` | as "latest" |
 
 The old `4apps.lv` wheel server is retired - move pins to `py_app_runner==<version>`.
 
@@ -56,9 +72,10 @@ The old `4apps.lv` wheel server is retired - move pins to `py_app_runner==<versi
   disagrees with the derived version, and refuses a GitHub pre-release.
 
 ```bash
-scripts/release_tag.bash          # creates v0.4.52 locally
-git push origin v0.4.52           # publishes nothing
-gh release create v0.4.52 --title v0.4.52 --generate-notes   # point of no return
+scripts/changelog.bash prepare    # Unreleased -> v0.7.1; commit CHANGELOG.md
+scripts/release_tag.bash          # creates v0.7.1 locally
+git push origin v0.7.1            # publishes nothing
+scripts/changelog.bash notes v0.7.1 | gh release create v0.7.1 --title v0.7.1 --notes-file -   # point of no return
 ```
 
 All three run on `ubuntu-latest`. The repository is public, and GitHub's org runner groups
@@ -134,8 +151,8 @@ cwd, which is usually `src/`, so use an absolute one). Unknown driver: the bridg
 - **Postgres-only**, refused on SQLite: `api_key_use_db` (bridge refuses to start), the queue's
   database driver, audit, and the `api_keys`/`crypto` CLIs - all connect through
   `migrations._service.connect_kwargs()`, which raises for a non-Postgres config.
-- A table rebuild on SQLite with foreign keys on: `PRAGMA defer_foreign_keys = ON` inside the
-  migration (`PRAGMA foreign_keys` cannot change inside a transaction).
+- A table rebuild on SQLite: `-- migrations:foreign-keys-off` on line 1. `defer_foreign_keys`
+  is not enough - `DROP TABLE` still fires `ON DELETE CASCADE`/`SET NULL` on the children.
 
 Redis is needed only by WebSocket routes, `@with_cache`/`@with_cache_and_db` and `@rate_limit`.
 "Configured" means `config["db"]["redis"]["hostname"]` is set. Without it there is no cache pool,
@@ -186,6 +203,10 @@ Mixing `targets` with a top-level `dir`/`table` is rejected.
   one statement** - Postgres wraps multi-statement sends in an implicit transaction. `apply`
   refuses at pre-flight (crude count: strip `--`, split on `;`). A failed one is not recorded and
   may have partially applied.
+- `-- migrations:foreign-keys-off` on line 1 (SQLite only, refused on Postgres at pre-flight):
+  `PRAGMA foreign_keys = OFF` before BEGIN, `PRAGMA foreign_key_check` before COMMIT - any
+  violation rolls the file back unrecorded - and back ON in every case. Cannot be combined
+  with `no-transaction`.
 - `DRIFT` (sha256 mismatch) and `MISSING` (tracked file deleted) block `apply`. `repair` fixes
   DRIFT only; MISSING needs the file restored, or `DELETE FROM migrations WHERE name = '<name>';`
   which `apply` prints.
@@ -216,12 +237,16 @@ python3 src/app.py crypto rotate --table T --column C [--id id] [--batch N] [--d
 - Config holds only env var *names*. `decrypt` reads the key id off the value, so a retired key
   keeps working while listed in `keys` - that is the rotation mechanism, and removing an id is permanent.
 - `decrypt(None)`→`None`, `decrypt("")`→`""`, non-`pa1:` returned verbatim (so a column can hold
-  both mid-backfill). A `pa1:` value that will not open always raises.
+  both mid-backfill). A `pa1:` value that will not parse or open always raises; `is_encrypted()`
+  means "carries the `pa1:` prefix".
+- `rotate` writes a row only while it still holds the value read (`AND col = old`); rows changed
+  meanwhile are left alone and counted. A malformed value aborts the run with exit 1.
 - `blind_index()` gives back equality lookups via a second, separately keyed column - not ranges
   or `LIKE`, and it deliberately does not normalise case or whitespace.
 - `envelope.py` — Python side of `magic(3) | version(1) | nonce(12) | ct | tag(16)`, the format
   `copasty-server` clients write. `validate()` is the check a keyless server can still make.
 - `PasswordHasher` wraps bcrypt with `needs_rehash()`. No salt column - bcrypt embeds it.
+  `hash()` refuses passwords over 72 bytes; `verify()` answers False for them, never raises.
 
 ## Audit Trail (`audit/`)
 
@@ -238,8 +263,9 @@ python3 src/app.py audit prune --before YYYY-MM-DD [--batch N] [--dry-run]
 - **The audit row is written on the caller's cursor, inside the caller's transaction** - a
   rolled-back change takes its row with it. No buffering, no batching, no shutdown flush.
   **A refactor must not defer the write.**
-- `update()`/`delete()` read affected rows before writing, so old values need no hand-written
-  before-fetch. `max_rows` is checked on that read, before anything is written.
+- `update()`/`delete()` read affected rows (`SELECT ... FOR UPDATE`, so UPDATE privilege is
+  needed even for `delete()`) before writing, so old values need no hand-written before-fetch.
+  `max_rows` is checked on that read, before anything is written.
 - `insert()` always uses `RETURNING`; any other way of getting the id means guessing at a sequence,
   and the failure mode is an empty `entity_id`.
 - Comparison is neither `==` nor `str()` - `diff.same()` normalises per type, since psycopg
@@ -248,7 +274,10 @@ python3 src/app.py audit prune --before YYYY-MM-DD [--batch N] [--dry-run]
 - Request context is a per-request `ContextVar` (`request_context(...)`), never process-wide.
 - `strict` (default on) raises on a failed write. With it off, note a failed INSERT still aborts
   the surrounding Postgres transaction - use a savepoint.
-- A malformed `exclude` block is refused at construction; redaction fails open by nature.
+- A malformed `exclude` block is refused at construction; redaction fails open by nature, so
+  matching is forgiving: case-insensitive, a bare `users` key matches the table in any schema,
+  `schema.table` only that schema. `record()` is the one place redaction happens, so a
+  hand-built event is covered too.
 - Columns are cut to fit rather than rejected.
 - `audit install` writes the schema into the *project's* migrations directory - the framework
   ships no migration of its own.
@@ -278,13 +307,20 @@ python3 src/app.py queue status | failed [--limit N] | retry (--id N|--all) | fo
   `release()` never touches it.
 - Queue precedence is sequential, not a merged sort: `["high", "default"]` drains `high` first.
 - Every time comparison binds an application-computed UTC value, never `now()`.
-- Uniqueness is scoped to pending, released on completion and failure; one partial unique index.
+- Uniqueness is scoped to pending, released on completion and failure - finished jobs are
+  deleted and failed ones move tables, so one plain unique index covers it.
 - Payloads are JSON, never pickle - an unpickle here would be RCE in a table. An undecodable
   payload goes straight to failed.
 - Per-job timeout is `asyncio.timeout()`, which cancels a task blocked in a query; the visibility
   timeout backstops a worker that dies outright.
-- Handler names resolve as `module:attr` or a configured alias, alias first - a renamed class
-  keeps working without touching the rows naming it.
+- Handler names resolve as a configured alias, alias first - a renamed class keeps working
+  without touching the rows naming it. **A non-empty `handlers` map is an allow-list**: only its
+  aliases and the import paths it names resolve. With no map any `module:attr` is imported, so
+  whoever can write a row picks the callable - configure `handlers` in every project.
+- A job claimed with `attempts >= max_attempts` (its worker died, or it released itself on the
+  last attempt) goes to failed at claim, never to a handler. Both drivers.
+- `delete`/`release`/`fail` act only for the claim the worker holds (`reserved_by` + `attempts`);
+  a worker whose expired claim was taken over is a no-op with a warning.
 - Exit contract: `0` for every ordinary end, `1` only for repeated reserve failures. A failed
   *job* never changes the exit code.
 
@@ -300,6 +336,8 @@ in `interface.py`; `tests/test_queue_contract.py` runs one suite against both. A
 - One stream per priority (`q:{queue}:s:{n}`), a sorted set for scheduled, a hash per job. Stream
   entries are immutable, so the stream indexes what is *ready* and carries only the id; the hash is the job.
 - `XAUTOCLAIM` runs **before** `XREADGROUP` per level, so a dead worker's job beats new work.
+  Each level is tried up to `CLAIM_ROUNDS` entries, so failing an exhausted job or parking one
+  does not drop the search to a lower priority.
 - The group is created at `0`, not `$` - jobs are pushed before any worker starts.
 - `XAUTOCLAIM` knows idle time, not liveness. `reserved_until` is authoritative, so an entry
   reclaimed while its claim is valid is **parked** back into the delayed set, costing no attempt.
@@ -341,7 +379,9 @@ python3 src/app.py cron work
   run history and no catch-up: a minute that was missed is simply missed, exactly as with
   the crontab that calls it. `--job NAME` runs a job now regardless of its schedule.
 - **One lock per job, held by the scheduler for as long as the child runs** - a Postgres
-  advisory lock, or on a SQLite `db` a `flock` on `<database>.cron-<job>.lock` (`FileLock`).
+  advisory lock on `hashtextextended(name, 0x4A0B)` (64-bit, so two names cannot share one),
+  or on a SQLite `db` a `flock` on `<database>.cron-<job>.lock` (`FileLock`; lock files are
+  0600 and never followed through a symlink).
   A tick that finds the lock taken logs a warning and skips, exit 0 - that is the lock
   working, not a failure. A scheduler that dies drops the lock with its connection but
   leaves the child orphaned, so a job must survive that one overlap. `dry-run` and a tick
@@ -405,12 +445,18 @@ Config: `api_key_pepper` (flat key), `trusted_proxies` (list or CSV of IPs/CIDRs
   `disabled_at`/`deleted_at`); None refuses the request.
 - WebSocket: the key is validated once per connection; abilities and expiry per message; the
   record and the key's user are re-read every `api_key_recheck_seconds` (30), so a revoke or
-  disabled user lands within that window. The key's user is applied only to messages for
-  key-requiring services, and the connection is assigned to that user's fan-out.
+  disabled user lands within that window. The re-read runs on every message, so `key_can()` stays
+  current in services not requiring a key; only key-requiring services answer a refusal with 1401.
+  The key's user is applied only to messages for key-requiring services, and the connection is
+  assigned to that user's fan-out.
+- The socket's JWT is re-verified on every message, including ones that do not resend it: `exp`
+  is enforced and the user re-loaded every `api_key_recheck_seconds`. An impersonation token is
+  refused when the impersonator is missing, disabled or deleted.
 
 ## Rate Limiting (`throttle/`)
 
-Fixed-window counting on Redis. `@rate_limit` is built on it and keeps its signature.
+Fixed-window counting on Redis. `@rate_limit` is built on it (`Throttle.from_config`, so `prefix`
+and `fail_open` apply) and keeps its signature.
 
 ```python
 attempt = await Throttle(redis_con).hit(f"login:{email}", 5, 900)
@@ -446,10 +492,13 @@ async def method(self, input_data: dict) -> dict:
 ```
 
 - `@with_cache` — inject `self.redis_con`; `@with_cache_and_db` — both
-- `@rate_limit(max_requests, window_seconds)` — MUST come after `@with_cache`
+- `@rate_limit(max_requests, window_seconds)` — MUST come after `@with_cache`; raises
+  `RuntimeError` without `redis_con`. Anonymous callers are keyed on `client_ip()`, as is
+  `@audited`'s IP - never `request.remote_ip`, which `xheaders=True` lets any client set
 - `@require_auth_for_actions` — class decorator applying `@authenticated` to all `@action`
   methods, inherited ones included (dispatch resolves across the MRO, so guarding only the
-  class's own methods would leave base-class actions open)
+  class's own methods would leave base-class actions open), and via `__init_subclass__` to
+  actions a subclass adds or overrides
 
 ## Error Handling & Protocol
 
@@ -469,9 +518,12 @@ The `data` field is the sole payload container; `msg_id`, `service`, `auth_token
 ```
 
 This holds for HTTP too - `WebHandlerBase.error()` wraps both `HTTPException` and plain string
-errors in `data`. Status codes from `ApiHandler`: `HTTPException` → its own `http_status`; any
-other exception → `500`, never a 4xx; an action returning `None` → `204` with no body, mirroring
-the WebSocket path.
+errors in `data`. `msg_id` 0 is valid; a missing `msg_id`/`service` is `1001 Missing input data:
+<names>`, never echoing the message. An unparseable or non-object WS frame is `1000`, logged at
+WARNING as its length and a 64-char prefix - never the frame, never to Sentry.
+
+Status codes from `ApiHandler`: `HTTPException` → its own `http_status`; any other exception →
+`500`, never a 4xx; an action returning `None` → `204` with no body, mirroring the WebSocket path.
 
 Over HTTP the JSON body *is* the request; the query string may only name the `action` (the URL
 path wins). Nothing else from the URL reaches a service - it would sit in access logs and caches
@@ -484,12 +536,14 @@ through key-based redaction: any header name or JSON key containing a marker fro
 logged as `<redacted>` (`utils.is_sensitive_key`). Substring on purpose - a project's
 `X-Auth-Token` or `db_password` is covered without the framework knowing the name. Over-redaction
 in a log is the cheap failure; extend the marker list rather than special-casing a call site.
-Bare `auth`, `user` and `sas` stay out - they would hit `author`, `user_id` and `sass_file`.
+Bare `auth`, `user` and `sas` stay out - they would hit `author`, `user_id` and `sass_file` -
+as do bare `otp`, `pin` and `refresh` (`footprint`, `mapping`, `refresh_interval`). Form-encoded
+bodies are redacted by key like JSON; the body is parsed once, `json_args` reused for logging.
 
 Sentry uses the same list. `InitSentry` turns off frame locals (the resolved config is a local in
 `runner.main`, so every stack trace would ship it) and installs `SensitiveKeyScrubber`, which masks
-matching keys at any depth in extras, breadcrumbs and request data - copying nested containers,
-never mutating the application's own objects. Keys only: a password inside a URL value still passes.
+matching keys at any depth in extras, breadcrumbs and request data (a top-level JSON array body
+included) - copying nested containers, never mutating the application's own objects. Keys only: a password inside a URL value still passes.
 
 ## Downstream Integration
 
@@ -514,6 +568,8 @@ Config keys the framework reads:
 - `ws_allowed_origins` (str or list) — accepted WebSocket `Origin`s; falls back to the
   `WS_ALLOWED_ORIGINS` env var. Empty accepts any origin and logs a warning in prod.
 - `sentry.dsn`, `sentry.rate.performance`, `sentry.rate.profiles`
+- `max_body_size` (tornado app setting) — 10 MiB unless the project sets it; tornado's own
+  default is 100 MB, parsed before any auth check
 
 The env-var mapping splits on `_`, so a nested path must not run through a key already holding a
 scalar (`API_KEY_PEPPER` cannot coexist with `api.key`). Such a variable is logged and skipped.
@@ -526,7 +582,8 @@ docker/app/Dockerfile       # Multi-stage (base -> builder -> development)
 scripts/                    # version, release_tag, bump_version, pre-commit
 docker-compose.yml          # Development service
 pyproject.toml              # Metadata, dependencies, ruff config
-.version                    # Manual major.minor; CI appends the commit count
+.version                    # Manual major.minor; the patch comes from release tags
+CHANGELOG.md                # One line per change under "## Unreleased"
 LICENSE                     # MIT, shipped in the distributions
 ```
 

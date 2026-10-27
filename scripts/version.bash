@@ -4,21 +4,24 @@
 #
 # The version identity lives in two places only:
 #   .version   - major.minor, hand edited, the one thing a human decides
-#   git        - the patch number, derived from the commit count
+#   git tags   - the patch, counted per minor from the v<major.minor>.<patch> release tags
 #
-# The patch is the commit count rather than a hand maintained number, so it never needs a
-# commit of its own and cannot conflict on a merge. It keeps counting across a minor bump,
-# so 0.5 follows 0.4 without the patch resetting and every version sorts after the last.
+# The patch is the next release of the current minor: 0.7.0 is the first, then 0.7.1, and
+# a minor bump starts again at 0. It is read off the tags rather than stored, so it never
+# needs a commit of its own and cannot conflict on a merge, and rewriting history cannot
+# hand back a number that was already published.
 #
 # Usage: scripts/version.bash [--dev]
 #
-#   --dev   Print the develop-channel version instead: "0.4.50.dev0".
+#   (none)  A commit carrying a release tag of this minor prints that tag's version, so the
+#           publish workflow derives what was tagged. Any other commit prints the next one.
+#   --dev   The develop-channel version: "0.7.3.dev5", the next patch plus the number of
+#           commits since the newest release tag, which makes each develop push unique.
 #
 # PEP 440 sorts a dev release below its own final release and above the previous one
-# (0.4.45 < 0.4.50.dev0 < 0.4.50), and pip hides it unless asked with --pre. The dev
-# number is a constant 0 because the commit count already makes each build unique.
+# (0.7.2 < 0.7.3.dev5 < 0.7.3), and pip hides it unless asked with --pre.
 #
-# Prints a bare "0.4.45". scripts/release_tag.bash adds the "v" for the tag name.
+# Prints a bare "0.7.3". scripts/release_tag.bash adds the "v" for the tag name.
 
 set -Eeuo pipefail
 
@@ -54,20 +57,44 @@ fi
 # PyPI parses this as PEP 440, and a typo here is a version that either fails to upload or
 # uploads as something unexpected - and an upload can never be replaced
 if [[ ! "$MAJOR_MINOR" =~ ^[0-9]+\.[0-9]+$ ]]; then
-    echo "error: ${VERSION_FILE} must be major.minor, e.g. 0.4 - found \"${MAJOR_MINOR}\"" >&2
+    echo "error: ${VERSION_FILE} must be major.minor, e.g. 0.7 - found \"${MAJOR_MINOR}\"" >&2
     exit 1
 fi
 
-# A shallow clone has no history to count, and would silently produce version .1
+# A shallow clone has neither the tags nor the history to count
 if [ "$(git -C "$BASE_PATH" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
     echo "error: shallow clone - fetch full history (actions/checkout needs fetch-depth: 0)" >&2
     exit 1
 fi
 
-COMMIT_COUNT="$(git -C "$BASE_PATH" rev-list --count HEAD)"
+MINOR_TAGS="$(git -C "$BASE_PATH" tag -l "v${MAJOR_MINOR}.*" | grep -E "^v${MAJOR_MINOR//./\\.}\.[0-9]+$" | sort -V || true)"
 
-if [ "$DEV" = true ]; then
-    printf '%s.%s.dev0\n' "$MAJOR_MINOR" "$COMMIT_COUNT"
-else
-    printf '%s.%s\n' "$MAJOR_MINOR" "$COMMIT_COUNT"
+if [ "$DEV" = false ]; then
+    HEAD_TAG="$(git -C "$BASE_PATH" tag --points-at HEAD | grep -Fx -f <(printf '%s\n' "$MINOR_TAGS") | sort -V | tail -1 || true)"
+    if [ -n "$HEAD_TAG" ]; then
+        printf '%s\n' "${HEAD_TAG#v}"
+        exit 0
+    fi
 fi
+
+LATEST_MINOR_TAG="$(printf '%s\n' "$MINOR_TAGS" | tail -1)"
+if [ -n "$LATEST_MINOR_TAG" ]; then
+    NEXT_PATCH=$((${LATEST_MINOR_TAG##*.} + 1))
+else
+    NEXT_PATCH=0
+fi
+
+if [ "$DEV" = false ]; then
+    printf '%s.%s\n' "$MAJOR_MINOR" "$NEXT_PATCH"
+    exit 0
+fi
+
+# Counted from the newest release of any minor: a freshly bumped minor has no tag of its own
+LATEST_TAG="$(git -C "$BASE_PATH" tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+if [ -n "$LATEST_TAG" ]; then
+    DEV_NUMBER="$(git -C "$BASE_PATH" rev-list --count "${LATEST_TAG}..HEAD")"
+else
+    DEV_NUMBER="$(git -C "$BASE_PATH" rev-list --count HEAD)"
+fi
+
+printf '%s.%s.dev%s\n' "$MAJOR_MINOR" "$NEXT_PATCH" "$DEV_NUMBER"

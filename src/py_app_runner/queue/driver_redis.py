@@ -32,9 +32,10 @@ declaring them, so a cluster would refuse them.
 
 import datetime
 import json
+import logging
 from typing import Any
 
-from py_app_runner.queue.driver_pg import encode_payload
+from py_app_runner.queue.driver_pg import CLAIM_ROUNDS, EXHAUSTED_ERROR, encode_payload
 from py_app_runner.queue.job import Job, QueueError
 
 # One consumer name for the whole fleet. Naming consumers per host and pid would leak a dead
@@ -48,6 +49,8 @@ CONSUMER = "shared"
 PROMOTE_LIMIT = 50
 
 MAX_ERROR_BYTES = 60000
+
+_logger = logging.getLogger(__name__)
 
 
 def fit_error(error: str) -> str:
@@ -108,7 +111,8 @@ end
 return tostring(id)
 """
 
-# ARGV: prefix, queue, now, timeout, worker, group, consumer, promote_limit
+# ARGV: prefix, queue, now, timeout, worker, group, consumer, promote_limit, rounds,
+#       failed_at, exhausted_error
 #
 # Promote what is due, then walk the priority levels highest first. XAUTOCLAIM runs before
 # XREADGROUP on each level so a dead worker's job is retried before new work is started,
@@ -144,24 +148,32 @@ for i = 1, #ranked do
     -- $ would skip every one of them. pcall because it errors if the group already exists.
     redis.pcall('XGROUP', 'CREATE', stream, group, '0', 'MKSTREAM')
 
-    local taken = nil
-    local auto = redis.call('XAUTOCLAIM', stream, group, consumer, timeout * 1000, '0-0', 'COUNT', 1)
-    if auto and auto[2] and auto[2][1] and auto[2][1][2] then
-        taken = auto[2][1]
-    end
-
-    if not taken then
-        local read = redis.call('XREADGROUP', 'GROUP', group, consumer,
-            'COUNT', 1, 'STREAMS', stream, '>')
-        if read and read[1] and read[1][2] and read[1][2][1] then
-            taken = read[1][2][1]
+    -- Every outcome short of a claim removes the entry it looked at, so each round makes
+    -- progress; the bound keeps one call short when a level is full of them.
+    for round = 1, tonumber(ARGV[9]) do
+        local taken = nil
+        local auto = redis.call('XAUTOCLAIM', stream, group, consumer, timeout * 1000, '0-0', 'COUNT', 1)
+        if auto and auto[2] and auto[2][1] and auto[2][1][2] then
+            taken = auto[2][1]
         end
-    end
 
-    if taken then
+        if not taken then
+            local read = redis.call('XREADGROUP', 'GROUP', group, consumer,
+                'COUNT', 1, 'STREAMS', stream, '>')
+            if read and read[1] and read[1][2] and read[1][2][1] then
+                taken = read[1][2][1]
+            end
+        end
+
+        if not taken then
+            break
+        end
+
         local entry, id = taken[1], taken[2][2]
         local job = p .. 'j:' .. id
         local until_ = tonumber(redis.call('HGET', job, 'reserved_until') or '0') or 0
+        local attempts = tonumber(redis.call('HGET', job, 'attempts') or '0') or 0
+        local max_attempts = tonumber(redis.call('HGET', job, 'max_attempts') or '1') or 1
         if redis.call('EXISTS', job) == 0 then
             -- The hash is gone: a tombstone entry for a job already completed. Drop it.
             redis.call('XACK', stream, group, entry)
@@ -174,6 +186,20 @@ for i = 1, #ranked do
             redis.call('HSET', job, 'entry', '')
             redis.call('XACK', stream, group, entry)
             redis.call('XDEL', stream, entry)
+        elseif attempts >= max_attempts then
+            -- The worker's own out-of-attempts check only runs when a handler raises. A
+            -- handler that kills its worker comes back here instead, and XAUTOCLAIM would
+            -- hand it out forever, ahead of new work. Failed as _FAIL does, keeping its id.
+            redis.call('XACK', stream, group, entry)
+            redis.call('XDEL', stream, entry)
+            local uk = redis.call('HGET', job, 'unique_key')
+            if uk and uk ~= '' then
+                redis.call('DEL', p .. 'u:' .. uk)
+                redis.call('HSET', job, 'unique_key', '')
+            end
+            redis.call('HSET', job, 'error', ARGV[11], 'failed_at', ARGV[10],
+                'reserved_until', '0', 'reserved_by', '', 'entry', '')
+            redis.call('ZADD', p .. 'failed', now, id)
         else
             redis.call('HINCRBY', job, 'attempts', 1)
             redis.call('HSET', job, 'reserved_by', worker,
@@ -186,13 +212,25 @@ end
 return nil
 """
 
-# ARGV: prefix, queue, id, entry, group
-_COMPLETE = """
+# The opening of every script that ends a claim. ARGV: prefix, queue, id, entry, group,
+# reserved_by, attempts, then the script's own.
+_HELD = """
 local p, queue, id, entry, group = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
 local job = p .. 'j:' .. id
+
+-- A worker whose claim was taken over must leave the job alone: XAUTOCLAIM handed the new
+-- holder this same stream entry, and acknowledging it would drop their claim.
+if redis.call('HGET', job, 'reserved_by') ~= ARGV[6] or redis.call('HGET', job, 'attempts') ~= ARGV[7] then
+    return 0
+end
+
 local level = redis.call('HGET', job, 'priority') or '0'
 local stream = p .. 'q:' .. queue .. ':s:' .. level
+"""
 
+_COMPLETE = (
+    _HELD
+    + """
 redis.call('XACK', stream, group, entry)
 redis.call('XDEL', stream, entry)
 
@@ -204,32 +242,28 @@ end
 redis.call('DEL', job)
 return 1
 """
+)
 
-# ARGV: prefix, queue, id, entry, group, available_at, error
-_RELEASE = """
-local p, queue, id, entry, group = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
-local job = p .. 'j:' .. id
-local level = redis.call('HGET', job, 'priority') or '0'
-local stream = p .. 'q:' .. queue .. ':s:' .. level
-
+# ARGV after _HELD's: available_at, error
+_RELEASE = (
+    _HELD
+    + """
 -- The delayed ZADD happens before the ACK and DEL on purpose: a crash between them leaves
 -- the job in both places, which a later reserve resolves, rather than in neither.
-redis.call('ZADD', p .. 'q:' .. queue .. ':delayed', tonumber(ARGV[6]), id)
-redis.call('HSET', job, 'available_at', ARGV[6], 'reserved_until', '0',
-    'reserved_by', '', 'last_error', ARGV[7], 'entry', '')
+redis.call('ZADD', p .. 'q:' .. queue .. ':delayed', tonumber(ARGV[8]), id)
+redis.call('HSET', job, 'available_at', ARGV[8], 'reserved_until', '0',
+    'reserved_by', '', 'last_error', ARGV[9], 'entry', '')
 
 redis.call('XACK', stream, group, entry)
 redis.call('XDEL', stream, entry)
 return 1
 """
+)
 
-# ARGV: prefix, queue, id, entry, group, error, now, failed_at
-_FAIL = """
-local p, queue, id, entry, group = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
-local job = p .. 'j:' .. id
-local level = redis.call('HGET', job, 'priority') or '0'
-local stream = p .. 'q:' .. queue .. ':s:' .. level
-
+# ARGV after _HELD's: error, now, failed_at
+_FAIL = (
+    _HELD
+    + """
 redis.call('XACK', stream, group, entry)
 redis.call('XDEL', stream, entry)
 
@@ -242,11 +276,12 @@ end
 -- No copy to a second structure: the hash stays where it is and joins the failed set, so
 -- `queue retry` puts back the job that failed rather than a reconstruction of it, and the
 -- id never changes.
-redis.call('HSET', job, 'error', ARGV[6], 'failed_at', ARGV[8],
+redis.call('HSET', job, 'error', ARGV[8], 'failed_at', ARGV[10],
     'reserved_until', '0', 'reserved_by', '', 'entry', '')
-redis.call('ZADD', p .. 'failed', tonumber(ARGV[7]), id)
+redis.call('ZADD', p .. 'failed', tonumber(ARGV[9]), id)
 return 1
 """
+)
 
 # ARGV: prefix, id, max_attempts, now
 _REQUEUE = """
@@ -288,6 +323,17 @@ end
 redis.call('DEL', p .. 'j:' .. id)
 return 1
 """
+
+
+def _stale(action: str, job: Job) -> None:
+    _logger.warning(
+        "Queue %s of job %s #%s ignored: %s no longer holds attempt %s, another worker took it over",
+        action,
+        job.name,
+        job.id,
+        job.reserved_by,
+        job.attempts,
+    )
 
 
 class RedisQueue:
@@ -371,7 +417,8 @@ class RedisQueue:
         return None
 
     async def _reserve_from(self, queue: str, timeout: int, worker: str) -> Job | None:
-        now = int(now_utc().timestamp())
+        moment = now_utc()
+        now = int(moment.timestamp())
 
         result = await self._reserve(
             keys=[],
@@ -384,6 +431,9 @@ class RedisQueue:
                 self.group,
                 CONSUMER,
                 PROMOTE_LIMIT,
+                CLAIM_ROUNDS,
+                stamp(moment),
+                EXHAUSTED_ERROR,
             ],
         )
 
@@ -401,6 +451,8 @@ class RedisQueue:
                 job_id=int(job_id),
                 queue=fields.get("queue") or queue,
                 entry=str(entry),
+                reserved_by=fields.get("reserved_by") or "",
+                attempts=fields.get("attempts") or "",
                 error="Payload is not valid JSON, so no handler could be given it.",
             )
             return None
@@ -432,6 +484,7 @@ class RedisQueue:
             attempts=max(1, int(fields.get("attempts") or 1)),
             max_attempts=max(1, int(fields.get("max_attempts") or 1)),
             handle=entry,
+            reserved_by=fields.get("reserved_by") or "",
         )
 
     ##################
@@ -439,12 +492,16 @@ class RedisQueue:
     ##################
 
     async def delete(self, job: Job) -> None:
-        await self._complete(keys=[], args=[self.prefix, job.queue, job.id, job.handle, self.group])
+        held = await self._complete(
+            keys=[], args=[self.prefix, job.queue, job.id, job.handle, self.group, job.reserved_by, job.attempts]
+        )
+        if not int(held):
+            _stale("delete", job)
 
     async def release(self, job: Job, delay: int = 0, error: str = "") -> None:
         now = int(now_utc().timestamp())
 
-        await self._release(
+        held = await self._release(
             keys=[],
             args=[
                 self.prefix,
@@ -452,18 +509,25 @@ class RedisQueue:
                 job.id,
                 job.handle,
                 self.group,
+                job.reserved_by,
+                job.attempts,
                 now + max(0, delay),
                 fit_error(error),
             ],
         )
+        if not int(held):
+            _stale("release", job)
 
     async def fail(self, job: Job, error: str) -> None:
-        await self._fail_raw(job.id, job.queue, job.handle, error)
+        if not await self._fail_raw(job.id, job.queue, job.handle, job.reserved_by, job.attempts, error):
+            _stale("fail", job)
 
-    async def _fail_raw(self, job_id: int, queue: str, entry: str, error: str) -> None:
+    async def _fail_raw(
+        self, job_id: int, queue: str, entry: str, reserved_by: str, attempts: int | str, error: str
+    ) -> bool:
         moment = now_utc()
 
-        await self._fail(
+        held = await self._fail(
             keys=[],
             args=[
                 self.prefix,
@@ -471,11 +535,15 @@ class RedisQueue:
                 job_id,
                 entry,
                 self.group,
+                reserved_by,
+                attempts,
                 fit_error(error),
                 int(moment.timestamp()),
                 stamp(moment),
             ],
         )
+
+        return bool(int(held))
 
     ###############
     ### Reports ###

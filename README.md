@@ -9,12 +9,12 @@ pip install py_app_runner                # the bridge, migrations, queue, audit,
 pip install 'py_app_runner[crypto,cron]'  # field encryption and the scheduler need their extras
 ```
 
-Every push to `develop` publishes a pre-release, `X.Y.<commit count>.dev0`. pip hides those
+Every push to `develop` publishes a pre-release of the next patch, `X.Y.Z.devN`. pip hides those
 unless you ask for them:
 
 ```bash
 pip install --pre py_app_runner        # newest, including dev builds
-pip install py_app_runner==0.4.50.dev0 # a specific dev build
+pip install py_app_runner==0.7.1.dev4  # a specific dev build
 ```
 
 ## Development

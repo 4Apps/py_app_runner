@@ -21,8 +21,8 @@ import psycopg
 from py_app_runner import file_lock
 from py_app_runner.cron.schedule import Job
 
-# Advisory locks in the two-int form live in their own keyspace, so this cannot collide
-# with the single-bigint key the migrations tracker takes.
+# Seed for hashtextextended(), which keys each job's lock on a 64-bit hash of its name: two
+# names sharing a key would make one of them silently never run.
 ADVISORY_NAMESPACE = 0x4A0B
 KILL_GRACE = 10.0
 
@@ -46,14 +46,14 @@ class PgLock:
 
     async def acquire(self, name: str) -> bool:
         async with self._conn.cursor() as cur:
-            await cur.execute("SELECT pg_try_advisory_lock(%s, hashtext(%s))", (ADVISORY_NAMESPACE, name))
+            await cur.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, %s))", (name, ADVISORY_NAMESPACE))
             row = await cur.fetchone()
 
         return bool(row and row[0])
 
     async def release(self, name: str) -> None:
         async with self._conn.cursor() as cur:
-            await cur.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", (ADVISORY_NAMESPACE, name))
+            await cur.execute("SELECT pg_advisory_unlock(hashtextextended(%s, %s))", (name, ADVISORY_NAMESPACE))
 
 
 class FileLock:

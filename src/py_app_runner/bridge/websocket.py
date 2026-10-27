@@ -16,7 +16,7 @@ from py_app_runner.http_exception import HTTPException
 from py_app_runner.registry import AppRegistry
 from py_app_runner.request_handler.handlers import RequestHandlerApiKeys
 from py_app_runner.return_model import MessageModel, ReturnModel, StatusModel
-from py_app_runner.utils import json_encode
+from py_app_runner.utils import format_response_for_log
 from py_app_runner.wbcm.ws_interface import WebSocketHandlerInterface
 
 _UNSET: Any = object()
@@ -45,8 +45,8 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
 
     encoder: MessageEncoder
 
-    # How long a socket trusts its cached key record and the key's user before reading
-    # both again, i.e. how late a revoked key or disabled user is noticed.
+    # How long a socket trusts its cached key record, the key's user and the token's user
+    # before reading them again, i.e. how late a revoked key or disabled user is noticed.
     api_key_recheck_seconds: float = 30
 
     #########################
@@ -69,6 +69,7 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
         self._api_key_checked_at = 0.0
         self._api_key_user_cache: Any = _UNSET
         self._auth_lookup_failed = False
+        self._auth_checked_at = 0.0
 
         super().__init__(*args, **kwargs)
 
@@ -109,7 +110,7 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
                 message["service"] = self.service
 
             # Add msg_id
-            if self.msg_id and "msg_id" not in message:
+            if self.msg_id is not None and "msg_id" not in message:
                 message["msg_id"] = self.msg_id
 
             # Add additional fields
@@ -158,12 +159,13 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             if hasattr(self, "_current_user"):
                 del self._current_user
 
-    async def _recheck_api_key(self) -> None:
+    async def _recheck_api_key(self) -> str | None:
         """Re-read the connection's key record once it is older than
-        api_key_recheck_seconds, so revoking or narrowing a key reaches an open socket."""
+        api_key_recheck_seconds, so revoking or narrowing a key reaches an open socket.
+        Returns why the key was dropped, or None if it was kept."""
         record = self._current_api_key
         if record is None or not getattr(record, "id", None):
-            return
+            return None
 
         refusal: str | None = None
         if time.monotonic() - self._api_key_checked_at >= self.api_key_recheck_seconds:
@@ -191,14 +193,15 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             self._current_api_key = None
             if not self.auth_token:
                 self._clear_current_user()
-            raise HTTPException(f"Application is not authenticated: {refusal}", code=1401, http_status=401)
+
+        return refusal
 
     ########################
     ### Request handling ###
     ########################
 
     async def reload_token(self, new_auth_token: str) -> None:
-        if new_auth_token == self.auth_token and not self._auth_lookup_failed:
+        if new_auth_token == self.auth_token and not self._auth_stale():
             return
 
         self.auth_token = new_auth_token
@@ -211,6 +214,19 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             self._auth_lookup_failed = True
             raise
         self._auth_lookup_failed = False
+
+    def _auth_stale(self) -> bool:
+        if self._auth_lookup_failed:
+            return True
+
+        if self._token_expires_at is not None and time.time() >= self._token_expires_at:
+            return True
+
+        return time.monotonic() - self._auth_checked_at >= self.api_key_recheck_seconds
+
+    async def _ensure_current_user(self) -> None:
+        await super()._ensure_current_user()
+        self._auth_checked_at = time.monotonic()
 
     def check_origin(self, origin: str) -> bool:
         allowed = allowed_ws_origins()
@@ -256,35 +272,41 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             self.close(4401, f"API key validation failed: {status}")
 
     async def on_message(self, message: str | bytes) -> None:
-        self.logger.debug(f"Received message ({self.encoder.name}): {message!r}")
         try:
             message_data = self.encoder.decode(message)
-        except Exception:
-            msg_str = "It was impossible to parse the given data"
-            self.logger.exception(f"Error: {msg_str}\nData: {message!r}")
-            self.error_message(msg_str, code=1000)
+            if not isinstance(message_data, dict):
+                raise ValueError("not an object")
+        except Exception as e:
+            # A client fault, sent before any authentication, and the frame can be megabytes
+            # long and carry credentials: a short prefix at WARNING, not the frame at ERROR.
+            self.logger.warning(
+                "Unparseable %s frame, length %d: %s; starts %r", self.encoder.name, len(message), e, message[:64]
+            )
+            self.error_message("It was impossible to parse the given data", code=1000)
             return
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "Received message (%s): %s",
+                self.encoder.name,
+                format_response_for_log(message_data, max_chars=4000, shrink_strings_to=256, cap_list_items=50),
+            )
 
         try:
             self._drop_api_key_user()
 
             # Assign message id
-            msg_id = message_data.get("msg_id", None)
-            service = message_data.get("service", None)
+            missing = [name for name in ("msg_id", "service") if message_data.get(name) in (None, "")]
+            if missing:
+                raise HTTPException(f"Missing input data: {', '.join(missing)}", code=1001, http_status=400)
 
-            if not msg_id or not service:
-                raise HTTPException(
-                    f"Missing input data; Data received: {json_encode(message_data, pretty=True)}",
-                    code=1001,
-                    http_status=400,
-                )
-
-            self.msg_id = int(msg_id)
+            service = message_data["service"]
+            self.msg_id = int(message_data["msg_id"])
             self.service = service
             res = self.find_service(service_name=service)
             if not res.result:
                 raise HTTPException(
-                    f"Could not find service by provided name: {self.service}",
+                    f"Could not find service by provided name: {str(self.service)[:100]}",
                     code=1002,
                     http_status=400,
                 )
@@ -293,9 +315,15 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
             if not bridge_request:
                 raise HTTPException(f"Service not found: {self.service}", code=1003, http_status=400)
 
+            # Every message, not only key-requiring ones: key_can() answers from the record.
+            key_refusal = await self._recheck_api_key()
+
             # Check cached API key validation from connection handshake;
             # fall back to in-message api_key (browsers cannot send custom headers on WS)
             if requires_api_key is not False:
+                if key_refusal:
+                    raise HTTPException(f"Application is not authenticated: {key_refusal}", code=1401, http_status=401)
+
                 if self._api_key_valid is None:
                     in_msg_api_key = message_data.get("api_key", None)
                     # Remember only the last rejected key, so retrying the same bad key
@@ -314,10 +342,9 @@ class BaseWebSocketHandler(RequestHandlerApiKeys, TornadoWebSocketHandler, WebSo
                         http_status=401,
                     )
 
-                await self._recheck_api_key()
-
-            # Set auth token
-            auth_token = message_data.get("auth_token", None)
+            # The connection's standing token too: it expires, and its user can be disabled,
+            # while the socket stays open.
+            auth_token = message_data.get("auth_token", None) or self.auth_token
             if auth_token:
                 await self.reload_token(auth_token)
 

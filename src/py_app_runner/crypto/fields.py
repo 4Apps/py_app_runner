@@ -265,29 +265,33 @@ class FieldCrypto:
 
 
 def split(value: str) -> tuple[str, str] | None:
-    """Pull the key id and payload out of a stored value, or None when it is not one."""
+    """Pull the key id and payload out of a stored value, or None when it is not one.
+
+    Raises for a value that claims the format and does not parse: handing it on as plaintext
+    would show a user ciphertext as their data, and let `rotate` leave it behind.
+    """
 
     if not value.startswith(f"{VERSION}:"):
         return None
 
     parts = value.split(":", 2)
-    if len(parts) != 3 or parts[1] == "" or parts[2] == "":
-        return None
-
-    if _KEY_ID_RE.match(parts[1]) is None:
-        return None
+    if len(parts) != 3 or parts[2] == "" or _KEY_ID_RE.match(parts[1]) is None:
+        raise CryptoError(f"Malformed {VERSION!r} value: expected {VERSION}:<key_id>:<base64 payload>")
 
     return (parts[1], parts[2])
 
 
 def is_encrypted(value: str | None) -> bool:
-    return value is not None and value != "" and split(value) is not None
+    """Whether a value carries the format - malformed or not, `decrypt` will not pass it through."""
+
+    return value is not None and value.startswith(f"{VERSION}:")
 
 
 def key_id_of(value: str | None) -> str | None:
     """Which key a stored value is under, without needing that key to be configured.
 
-    This is what lets `crypto rotate` report on values it cannot decrypt.
+    This is what lets `crypto rotate` report on values it cannot decrypt. Raises for a
+    malformed value, as `split` does.
     """
 
     if value is None or value == "":

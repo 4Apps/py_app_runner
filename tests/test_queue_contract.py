@@ -15,7 +15,9 @@ test_queue_driver_redis.py (redis). What is deliberately *not* here:
   insertion order, so a released job rejoins at the back rather than in due order.
 """
 
+import asyncio
 import datetime
+import logging
 import pathlib
 
 import psycopg
@@ -156,6 +158,42 @@ class TestReserve:
 
         assert len(claimed) == 10
         assert len(set(claimed)) == 10
+
+
+class TestExpiredClaims:
+    """A claim that runs out is the only trace a dead worker leaves. timeout=1 and a sleep
+    rather than editing the deadline, because redis also needs the entry to have gone idle."""
+
+    async def test_a_job_whose_worker_died_on_its_last_attempt_fails_instead_of_running_again(self, queue):
+        await queue.push("kills_its_worker", max_attempts=1)
+        assert await queue.reserve(["default"], 1, "dead-worker") is not None
+        await queue.push("next")
+
+        await asyncio.sleep(1.1)
+        job = await queue.reserve(["default"], 1, "w2")
+
+        assert job.name == "next"
+        rows = await queue.failed_rows(10)
+        assert [row["name"] for row in rows] == ["kills_its_worker"]
+        assert rows[0]["attempts"] == 1
+        assert "max attempts" in rows[0]["error"]
+
+    async def test_a_worker_whose_claim_was_taken_over_cannot_touch_the_job(self, queue, caplog):
+        await queue.push("send_email", max_attempts=3)
+        stale = await queue.reserve(["default"], 1, "slow-worker")
+        await asyncio.sleep(1.1)
+        current = await queue.reserve(["default"], 1, "w2")
+        assert current.id == stale.id
+
+        with caplog.at_level(logging.WARNING):
+            await queue.release(stale, 0, "late")
+            await queue.fail(stale, "late")
+            await queue.delete(stale)
+            await queue.delete(current)
+
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 3
+        assert await queue.failed_count() == 0
+        assert await queue.stats() == []
 
 
 class TestCompletion:

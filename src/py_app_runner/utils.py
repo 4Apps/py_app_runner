@@ -12,6 +12,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from functools import partial
 from typing import Any, ParamSpec, TypeGuard, TypeVar
+from urllib.parse import unquote_plus
 
 from msgspec import json as mjson
 
@@ -19,6 +20,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 BASE64_RX = re.compile(r"^[A-Za-z0-9+/=\s]+$")
+FORM_FIELD_RX = re.compile(r"(?:^|(?<=&))([^&=]*)=([^&]*)")
 
 
 def generate_random_string(length: int = 32) -> str:
@@ -279,7 +281,8 @@ async def run_blocking(fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) ->
 
 
 # Bare "auth", "user" and "sas" are left out on purpose: they would hit `author`, `user_id`
-# and `sass_file`. The cost accepted instead is `bypass`, `session_count` or `last_login`.
+# and `sass_file`; likewise "otp", "pin" and "refresh" (`footprint`, `mapping`,
+# `refresh_interval`). The cost accepted instead is `bypass`, `session_count` or `last_login`.
 SENSITIVE_KEY_MARKERS = (
     "authorization",
     "cookie",
@@ -295,6 +298,21 @@ SENSITIVE_KEY_MARKERS = (
     "privatekey",
     "account_key",
     "accountkey",
+    "access_key",
+    "access-key",
+    "accesskey",
+    "encryption_key",
+    "signing_key",
+    "hmac",
+    "jwt",
+    "bearer",
+    "totp",
+    "otp_code",
+    "otp-code",
+    "one_time_code",
+    "mfa_code",
+    "pin_code",
+    "pincode",
     "credential",
     "connection_string",
     "connectionstring",
@@ -318,6 +336,15 @@ def is_sensitive_key(name: Any) -> bool:
 
 def redact_headers(headers: dict[str, Any]) -> dict[str, Any]:
     return {k: ("<redacted>" if is_sensitive_key(k) else v) for k, v in (headers or {}).items()}
+
+
+def redact_form_fields(text: str) -> str:
+    """Mask the values of credential-looking `key=value` fields, the form-encoded
+    counterpart of the JSON redaction in shrink_json."""
+    return FORM_FIELD_RX.sub(
+        lambda m: f"{m[1]}=<redacted>" if is_sensitive_key(unquote_plus(m[1])) else m[0],
+        text,
+    )
 
 
 def sha1_prefix(b: bytes, n: int = 12) -> str:
@@ -364,6 +391,8 @@ def format_body_for_log(
         js = shrink_json(js, max_string=shrink_strings_to, max_items=cap_list_items)
         return truncate_middle(json_encode(js, pretty=True), max_chars)
     except Exception:
+        # Redacted before truncating: a field cut in half no longer shows its whole key.
+        text = redact_form_fields(text)
         return truncate_middle(summarize_maybe_base64(text, hard_cap=shrink_strings_to), max_chars)
 
 

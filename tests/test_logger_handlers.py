@@ -1,5 +1,8 @@
 import json
 import logging
+import random
+import string
+import time
 from argparse import Namespace
 from typing import Any
 
@@ -37,6 +40,18 @@ class TestRateControl:
 
         assert RateControl({"message": "ValueError at foo.py line 10"}, {}) is not None
         assert RateControl({"message": "completely different subsystem failure"}, {}) is not None
+
+    def test_comparison_cost_does_not_grow_with_the_event(self):
+        # Events carry client input, and comparing two large ones in full is quadratic.
+        reset_rate_state()
+        rng = random.Random(0)
+        first, second = ("".join(rng.choices(string.printable, k=200_000)) for _ in range(2))
+
+        started = time.perf_counter()
+        RateControl({"message": first}, {})
+        RateControl({"message": second}, {})
+
+        assert time.perf_counter() - started < 1
 
 
 class TestConsoleHandler:
@@ -106,3 +121,11 @@ class TestSentryScrubbing:
         assert sent["oauth"][0]["client_id"] == "abc"
         assert (sent["user_id"], sent["user_agent"], sent["sass_file"]) == (7, "curl", "site.scss")
         assert config == nested_config()
+
+    def test_json_array_request_body_is_masked(self, sentry_events):
+        sentry_sdk.capture_event({"message": "failed", "request": {"data": [{"password": SENTINEL, "name": "kept"}]}})
+
+        assert len(sentry_events) == 1
+        sent = sentry_events[0]["request"]["data"]
+        assert SENTINEL not in json.dumps(sent)
+        assert sent[0]["name"] == "kept"

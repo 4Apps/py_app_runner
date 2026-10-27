@@ -23,6 +23,9 @@ class Job:
     max_attempts: int
     # Driver bookmark. Empty on the database driver, the stream entry id on redis.
     handle: str = ""
+    # With `attempts`, identifies this claim: a worker whose claim expired and was taken over
+    # must not complete, release or fail the job on behalf of the one now holding it.
+    reserved_by: str = ""
 
     _release_delay: int | None = field(default=None, repr=False)
 

@@ -149,6 +149,16 @@ class TestRunningJobs:
 
         assert await queue.failed_count() == 1
 
+    async def test_with_handlers_configured_a_name_outside_them_is_not_imported(self, queue):
+        """Otherwise whoever can write a row picks the callable that receives its payload."""
+
+        await queue.push("tests.test_queue_worker:records", {"n": 1}, max_attempts=1)
+
+        await worker(queue, handlers={"send-email": "tests.test_queue_worker:always_fails"}).run_next(["default"])
+
+        assert ran == []
+        assert "not one of the configured queue handlers" in (await queue.failed_rows(10))[0]["error"]
+
     async def test_a_job_can_release_itself_without_being_a_failure(self, queue):
         """A deliberate "not now" - a rate limit upstream, a file that has not landed."""
 

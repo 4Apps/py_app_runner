@@ -21,19 +21,21 @@ jobs:
       # Mandatory for trusted publishing; no API token is stored anywhere
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.release.tag_name }}
-          # scripts/version.bash derives the patch from the commit count, so it needs the
-          # full history - a shallow clone would silently produce version .1
+          # scripts/version.bash derives the patch from the release tags and the dev number
+          # from the history since the newest one; a shallow clone has neither
           fetch-depth: 0
 
       # A GitHub pre-release would publish a plain final version here, which is not what
       # the marking says. Pre-releases come off develop, automatically, as .devN
       - name: Refuse a GitHub pre-release
         if: ${{ github.event.release.prerelease }}
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          echo "::error::${{ github.event.release.tag_name }} is marked as a pre-release." >&2
+          echo "::error::${TAG} is marked as a pre-release." >&2
           echo "Pre-releases are published from the develop branch as X.Y.N.dev0." >&2
           exit 1
 
@@ -41,8 +43,9 @@ jobs:
       # value. A mismatch here means the tag and the wheel would disagree about what this
       # release is, which nothing downstream can untangle afterwards.
       - name: Resolve and verify version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          TAG="${{ github.event.release.tag_name }}"
           VERSION="$(scripts/version.bash)"
           if [ "$TAG" != "v${VERSION}" ]; then
             echo "::error::tag ${TAG} does not match the derived version v${VERSION}." >&2
@@ -53,7 +56,7 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Publishing py_app_runner $VERSION"
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.x"
 
@@ -83,4 +86,4 @@ jobs:
 
       # No skip-existing: a duplicate here means the release was cut twice and should fail
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

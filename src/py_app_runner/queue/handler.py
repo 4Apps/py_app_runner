@@ -46,13 +46,22 @@ def _import_target(path: str) -> Any:
 def resolve(name: str, handlers: dict[str, Any] | None = None) -> HandlerCallable:
     """Resolve a job name to something awaitable.
 
-    Order: a configured alias wins, then the name is treated as an import path. The alias
-    short-circuits entirely, which is what lets a renamed class keep working without
-    touching the rows that name it.
+    A configured alias short-circuits entirely, which is what lets a renamed class keep
+    working without touching the rows that name it. Once any alias is configured, the map is
+    an allow-list of aliases and the import paths they name: whoever can write a row would
+    otherwise choose which module gets imported and which callable gets their payload. Only
+    with no map at all is any name an import path.
     """
 
-    configured = (handlers or {}).get(name)
-    target = configured if configured is not None else name
+    handlers = handlers or {}
+    if name in handlers:
+        target = handlers[name]
+    elif name in handlers.values():
+        target = name
+    elif handlers:
+        raise QueueError(f"No handler {name!r}: it is not one of the configured queue handlers.")
+    else:
+        target = name
 
     if isinstance(target, str):
         target = _import_target(target)

@@ -2,7 +2,7 @@ import datetime as dt
 
 import pytest
 
-from py_app_runner.utils import create_valid_hostname, is_sensitive_key, json_encoder
+from py_app_runner.utils import create_valid_hostname, format_body_for_log, is_sensitive_key, json_encoder
 
 
 class TestJsonEncoderDatetimes:
@@ -43,6 +43,13 @@ class TestCreateValidHostname:
         ("sentry_dsn", True),
         ("ssh_private_key", True),
         ("user_name", True),
+        ("id_token_jwt", True),
+        ("aws_access_key_id", True),
+        ("otp_code", True),
+        ("totp", True),
+        ("footprint", False),
+        ("mapping", False),
+        ("refresh_interval", False),
         ("author", False),
         ("authority", False),
         ("user_id", False),
@@ -54,3 +61,13 @@ class TestCreateValidHostname:
 )
 def test_is_sensitive_key(key: str, sensitive: bool):
     assert is_sensitive_key(key) is sensitive
+
+
+def test_form_encoded_body_is_redacted_by_key():
+    body = b"username=alice&pass%77ord=hunter2&remember=1&csrf_token=abc123"
+
+    logged = format_body_for_log(body, max_chars=4000, shrink_strings_to=256, cap_list_items=50)
+
+    for secret in ("alice", "hunter2", "abc123"):
+        assert secret not in logged, secret
+    assert "remember=1" in logged

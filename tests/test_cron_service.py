@@ -5,6 +5,7 @@ from argparse import Namespace
 import psycopg
 import pytest
 
+from py_app_runner import file_lock
 from py_app_runner.cron._service import app_argv, init_service
 from py_app_runner.cron._service_args import reg_subparsers
 from py_app_runner.cron.execute import FileLock, PgLock
@@ -68,6 +69,18 @@ class TestPgLock:
                 await first.release("sync")
                 assert await second.acquire("sync")
 
+    async def test_names_whose_32_bit_hashes_collide_get_their_own_lock(self):
+        async with pg_dsn_for("par_test_cron_lock") as dsn:
+            async with (
+                await psycopg.AsyncConnection.connect(dsn, autocommit=True) as a,
+                await psycopg.AsyncConnection.connect(dsn, autocommit=True) as b,
+            ):
+                hashes = await (await a.execute("SELECT hashtext('job-42049'), hashtext('job-89041')")).fetchone()
+                assert hashes[0] == hashes[1]
+
+                assert await PgLock(a).acquire("job-42049")
+                assert await PgLock(b).acquire("job-89041")
+
 
 class TestFileLock:
     async def test_second_holder_cannot_take_a_held_lock(self, tmp_path):
@@ -80,6 +93,17 @@ class TestFileLock:
 
         await first.release("sync")
         assert await second.acquire("sync")
+
+    def test_lock_file_is_private_and_never_followed_through_a_symlink(self, tmp_path):
+        target = tmp_path / "elsewhere"
+        target.write_text("")
+        (tmp_path / "planted.lock").symlink_to(target)
+
+        file_lock.unlock(file_lock.lock(str(tmp_path / "fresh.lock")))
+
+        assert (tmp_path / "fresh.lock").stat().st_mode & 0o777 == 0o600
+        with pytest.raises(OSError):
+            file_lock.lock(str(tmp_path / "planted.lock"))
 
     def test_names_differing_only_in_unsafe_characters_get_their_own_file(self, tmp_path):
         lock = FileLock(str(tmp_path / "app.sqlite3"))

@@ -1,12 +1,15 @@
+import contextlib
 import pathlib
+import re
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 
 import psycopg
 from database_wrapper_sqlite import SqliteConnectionAsync
 
 from py_app_runner.migrations.discovery import (
+    FOREIGN_KEYS_OFF_DIRECTIVE,
     MigrationError,
     count_statements,
     discover,
@@ -21,6 +24,8 @@ from py_app_runner.migrations.tracker_sqlite import SqliteTracker
 
 Out = Callable[[str], None]
 Connection = psycopg.AsyncConnection | SqliteConnectionAsync
+
+_PLAIN_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
 def _make_tracker(conn: Connection, table: str) -> Tracker | SqliteTracker:
@@ -47,6 +52,51 @@ async def _execute(conn: Connection, sql: str) -> None:
 
     async with conn.cursor() as cur:
         await cur.execute(sql.encode(conn.info.encoding))
+
+
+@contextlib.asynccontextmanager
+async def _foreign_keys_off(conn: Connection, enabled: bool) -> AsyncIterator[None]:
+    """SQLite's DROP TABLE deletes every row first, firing ON DELETE CASCADE / SET NULL on the
+    children, so a table rebuild needs enforcement off. The pragma is a no-op inside a
+    transaction, so it is switched around the file's transaction rather than within it."""
+
+    if not enabled or not isinstance(conn, SqliteConnectionAsync):
+        yield
+        return
+
+    await conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        yield
+    finally:
+        await conn.execute("PRAGMA foreign_keys = ON")
+
+
+async def _check_foreign_keys(conn: Connection) -> None:
+    """Raise inside the file's transaction, so a rebuild that leaves a dangling reference is
+    rolled back instead of committed with enforcement off."""
+
+    if not isinstance(conn, SqliteConnectionAsync):
+        return
+
+    cur = await conn.execute("PRAGMA foreign_key_check")
+    violations = await cur.fetchall()
+    if not violations:
+        return
+
+    shown = "; ".join(f"{row['table']} rowid {row['rowid']} -> {row['parent']}" for row in violations[:10])
+    more = f" (and {len(violations) - 10} more)" if len(violations) > 10 else ""
+    raise MigrationError(f"foreign key check failed: {shown}{more}")
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_identifier(name: str) -> str:
+    if _PLAIN_IDENTIFIER.match(name):
+        return name
+
+    return '"' + name.replace('"', '""') + '"'
 
 
 async def _load_states(
@@ -82,7 +132,10 @@ def _report_blocking(states: list[MigrationState], table: str, out: Out) -> None
 
         out(f"MISSING: {state.name} is gone, so `migrations repair` cannot help. Restore the file")
         out("from version control, or - if it is gone for good and its schema change is known to")
-        out(f"be in place - drop the tracking row:  DELETE FROM {table} WHERE name = '{state.name}';")
+        out(
+            f"be in place - drop the tracking row:  "
+            f"DELETE FROM {_sql_identifier(table)} WHERE name = {_sql_literal(state.name)};"
+        )
 
 
 async def cmd_status(
@@ -192,6 +245,12 @@ async def cmd_apply(
                 out("each no-transaction migration contains exactly one statement.")
                 return 1
 
+            if state.file.foreign_keys_off and not isinstance(conn, SqliteConnectionAsync):
+                out(f"error: {state.name} is marked `{FOREIGN_KEYS_OFF_DIRECTIVE}`, which is for SQLite")
+                out("table rebuilds only. Postgres does not delete rows to drop a table, so it has")
+                out("nothing to switch off; remove the directive.")
+                return 1
+
         for state in queue:
             assert state.file is not None
             if dry_run:
@@ -209,8 +268,10 @@ async def cmd_apply(
                 else:
                     # The tracking row is written inside the same transaction as the
                     # migration, so a file either fully lands and is recorded, or neither.
-                    async with conn.transaction():
+                    async with _foreign_keys_off(conn, state.file.foreign_keys_off), conn.transaction():
                         await _execute(conn, state.file.sql)
+                        if state.file.foreign_keys_off:
+                            await _check_foreign_keys(conn)
 
                         duration_ms = int((time.monotonic() - started) * 1000)
                         await tracker.record(state.name, state.file.checksum, duration_ms, applied_by)

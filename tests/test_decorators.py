@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 
 from py_app_runner.http_exception import HTTPException
+from py_app_runner.registry import AppRegistry
 from py_app_runner.request_handler.decorators import (
     _sanitize_input,
     action,
@@ -33,7 +34,9 @@ class FakeHandler:
         self.db_wrapper = MagicMock()
         self.bridge_handler = MagicMock()
         self.bridge_handler.current_user = MagicMock(id=42)
-        self.bridge_handler.request.remote_ip = "10.0.0.1"
+        self.bridge_handler.client_ip.return_value = "10.0.0.1"
+        # What xheaders=True makes of a client-sent X-Real-IP.
+        self.bridge_handler.request.remote_ip = "192.0.2.66"
         self.bridge_handler.request.headers = {"User-Agent": "test-agent"}
 
 
@@ -115,6 +118,30 @@ class TestRequireAuthForActions:
         assert asyncio.run(handler.guarded({})) == "ok"
         assert calls == ["ran"]
 
+    async def test_subclass_actions_are_guarded(self):
+        @require_auth_for_actions
+        class Base(RequestHandlerHelper):
+            @action("base")
+            async def base(self, input_data: dict[str, Any]) -> str:
+                return "reached handler"
+
+        class Child(Base):
+            @action("base")
+            async def base(self, input_data: dict[str, Any]) -> str:
+                return "reached handler"
+
+            @action("added")
+            async def added(self, input_data: dict[str, Any]) -> str:
+                return "reached handler"
+
+        bridge_handler = MagicMock()
+        bridge_handler.current_user = None
+
+        for action_name in ("base", "added"):
+            with pytest.raises(HTTPException) as excinfo:
+                await Child().handle_request(action_name, {}, bridge_handler)
+            assert excinfo.value.http_status == 401, action_name
+
     def test_actions_still_dispatchable_after_wrapping(self):
         @require_auth_for_actions
         class Handler(RequestHandlerHelper):
@@ -130,6 +157,7 @@ class RateLimitedHandler:
         self.redis_con = redis_con
         self.bridge_handler = MagicMock()
         self.bridge_handler.current_user = MagicMock(id=7)
+        self.bridge_handler.client_ip.return_value = "203.0.113.5"
 
     @rate_limit(2, 60)
     async def limited(self, input_data: dict[str, Any]) -> str:
@@ -190,11 +218,32 @@ class TestRateLimit:
 
         assert len(await redis_con.keys("*")) == 2
 
-    async def test_without_redis_it_warns_and_lets_the_call_through(self):
-        """Enforcement is best-effort by design: a cache outage must not take the
-        application down with it."""
+    async def test_anonymous_callers_are_keyed_on_the_trusted_client_ip(self, redis_con):
+        # xheaders=True fills request.remote_ip from X-Real-IP, which the client chooses.
+        handler = RateLimitedHandler(redis_con)
+        handler.bridge_handler.current_user = None
+
+        for spoofed in ("192.0.2.1", "192.0.2.2"):
+            handler.bridge_handler.request.remote_ip = spoofed
+            assert await handler.limited({}) == "ok"
+
+        handler.bridge_handler.request.remote_ip = "192.0.2.3"
+        with pytest.raises(HTTPException) as excinfo:
+            await handler.limited({})
+        assert excinfo.value.http_status == 429
+
+    async def test_throttle_config_is_honoured(self, redis_con, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(AppRegistry, "_config", {"throttle": {"prefix": "custom:"}})
+
+        await RateLimitedHandler(redis_con).limited({})
+
+        assert [key.split(":")[0] for key in await redis_con.keys("*")] == ["custom"]
+
+    async def test_without_a_redis_connection_it_refuses_to_run(self):
+        """Missing redis_con is a decorator-order mistake, and silently not limiting is
+        the failure nobody notices. A Redis outage is Throttle's fail_open, not this."""
 
         handler = RateLimitedHandler(None)
-        handler.redis_con = None
 
-        assert await handler.limited({}) == "ok"
+        with pytest.raises(RuntimeError):
+            await handler.limited({})

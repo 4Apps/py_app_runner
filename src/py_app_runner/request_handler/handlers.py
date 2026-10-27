@@ -76,6 +76,7 @@ class RequestHandlerBase(web.RequestHandler):
     # Temporary variables
     _current_user_obj: Any | None
     _impersonator_obj: Any | None
+    _token_expires_at: int | None = None
     json_args: dict[str, Any] | None
     require_json_response: bool
     module = None
@@ -251,8 +252,7 @@ class RequestHandlerBase(web.RequestHandler):
         detail_log("Headers: %s", headers)
 
         if include_body:
-            body_for_log = format_body_for_log(
-                body_raw,
+            body_for_log = self._body_for_log(
                 max_chars=max_field_chars,
                 shrink_strings_to=shrink_strings_to,
                 cap_list_items=cap_list_items,
@@ -270,6 +270,21 @@ class RequestHandlerBase(web.RequestHandler):
             )
             detail_log("Response: %s", resp_for_log)
 
+    def _body_for_log(self, *, max_chars: int, shrink_strings_to: int, cap_list_items: int) -> str:
+        # The parsed body when there is one: the raw body is unauthenticated input of up to
+        # max_body_size, and parsing it again on every log line multiplies its cost.
+        if self.json_args is not None:
+            return format_response_for_log(
+                self.json_args, max_chars=max_chars, shrink_strings_to=shrink_strings_to, cap_list_items=cap_list_items
+            )
+
+        return format_body_for_log(
+            getattr(self.request, "body", b""),
+            max_chars=max_chars,
+            shrink_strings_to=shrink_strings_to,
+            cap_list_items=cap_list_items,
+        )
+
     ###############
     ### Prepare ###
     ###############
@@ -279,16 +294,14 @@ class RequestHandlerBase(web.RequestHandler):
         if inspect.isawaitable(res):
             await res
 
-        # Debug
-        self.logger.debug(f"Request: {self.request}")
-        self.logger.debug("Headers: %s", redact_headers(dict(self.request.headers)))
-        self.logger.debug(
-            "Body: %s",
-            format_body_for_log(self.request.body, max_chars=4000, shrink_strings_to=256, cap_list_items=50),
-        )
-        self.logger.debug(f"Arguments: {self.request.arguments.keys()}")
-
         self._ensure_content_type()
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("Request: %s", self.request)
+            self.logger.debug("Headers: %s", redact_headers(dict(self.request.headers)))
+            self.logger.debug("Body: %s", self._body_for_log(max_chars=4000, shrink_strings_to=256, cap_list_items=50))
+            self.logger.debug("Arguments: %s", list(self.request.arguments))
+
         await self._ensure_current_user()
 
     def _ensure_content_type(self):
@@ -329,6 +342,7 @@ class RequestHandlerBase(web.RequestHandler):
     async def _ensure_current_user(self):
         # Run BEFORE get/post/etc.
         self._impersonator_obj = None
+        self._token_expires_at = None
 
         # Clear Tornado's cached current_user so the property re-evaluates.
         # Critical for WebSocket handlers where the same instance handles
@@ -380,12 +394,13 @@ class RequestHandlerBase(web.RequestHandler):
 
             user = await UsersModel.get_by_public_id(user_public_id, pg_cur)
 
+            impersonator = None
             if is_impersonation:
-                imp_public_id = payload.get("imp")
-                if imp_public_id:
-                    impersonator = await UsersModel.get_by_public_id(imp_public_id, pg_cur)
-                    if impersonator and not impersonator.disabled_at and not impersonator.deleted_at:
-                        self._impersonator_obj = impersonator
+                impersonator = await UsersModel.get_by_public_id(payload["imp"], pg_cur)
+                # The token's authority is the impersonator's: once they are gone, so is the session.
+                if not impersonator or impersonator.disabled_at or impersonator.deleted_at:
+                    self._clear_current_user()
+                    return
 
         if not user or user.disabled_at or user.deleted_at:
             self._clear_current_user()
@@ -393,6 +408,8 @@ class RequestHandlerBase(web.RequestHandler):
 
         # Cache it for this request
         self._current_user_obj = user
+        self._impersonator_obj = impersonator
+        self._token_expires_at = payload["exp"]
 
         # Tag WS connections with the user id so per-user pushes can reach them
         # without every project re-wiring this in a subclass. HTTP handlers have

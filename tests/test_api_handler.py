@@ -1,6 +1,10 @@
+from typing import Any
+from unittest import mock
+
 from tornado.testing import AsyncHTTPTestCase
 from tornado.web import Application
 
+from py_app_runner import utils
 from py_app_runner.http_exception import HTTPException
 from py_app_runner.registry import AppRegistry
 from py_app_runner.utils import json_encode
@@ -66,3 +70,22 @@ class TestApiHandlerInput(AsyncHTTPTestCase):
 
         assert response.code == 200
         assert self.echo.calls == [("go", {})]
+
+    def test_body_is_decoded_once_however_often_it_is_logged(self):
+        # The body arrives before authentication, so every extra parse is the client's to multiply.
+        decoded: list[int] = []
+        real_decoder = utils.ms_decoder
+
+        class CountingDecoder:
+            def decode(self, value: Any) -> Any:
+                decoded.append(len(value))
+                return real_decoder.decode(value)
+
+        body = json_encode({"action": "login", "data": {"email": "a@b.c"}})
+        with mock.patch.object(utils, "ms_decoder", CountingDecoder()), self.assertLogs("py_app_runner", "DEBUG"):
+            response = self.fetch(
+                "/api/rejecting", method="POST", body=body, headers={"Content-Type": "application/json"}
+            )
+
+        assert response.code == 401
+        assert decoded == [len(body)]

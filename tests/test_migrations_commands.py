@@ -246,6 +246,14 @@ class TestApply:
         assert await cmd_apply(conn, migrations_dir, "migrations", True, None, "test", out) == 1
         assert any("more than one statement" in line for line in lines)
 
+    async def test_refuses_the_sqlite_foreign_keys_off_directive(self, conn, migrations_dir, printed):
+        lines, out = printed
+        write(migrations_dir, "2026-08-04-091530-a.sql", "-- migrations:foreign-keys-off\nCREATE TABLE a (id int);")
+
+        assert await cmd_apply(conn, migrations_dir, "migrations", False, None, "test", out) == 1
+        assert any("foreign-keys-off" in line for line in lines)
+        assert not await table_exists(conn, "a")
+
     async def test_a_multi_statement_file_without_the_directive_is_still_fine(
         self, conn, migrations_dir, printed
     ):

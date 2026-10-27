@@ -9,10 +9,17 @@ import fcntl
 import os
 
 
+def _open(path: str) -> int:
+    """Private to the owner, since anyone who can open a lock file can flock it and hold the
+    lock. No symlink is followed, so a planted one cannot point the lock elsewhere."""
+
+    return os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+
+
 def try_lock(path: str) -> int | None:
     """The locked file descriptor, or None when another holder has it."""
 
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = _open(path)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -28,7 +35,7 @@ def try_lock(path: str) -> int | None:
 def lock(path: str) -> int:
     """Blocks until the lock is free."""
 
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = _open(path)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
     except BaseException:

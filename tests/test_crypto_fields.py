@@ -69,8 +69,19 @@ class TestPassthrough:
         mean the backfill could never start."""
 
         c = crypto()
-        for value in ("plain", VERSION, f"{VERSION}:", f"{VERSION}:BADKEY:zzz", "nope:k1:zz"):
+        for value in ("plain", VERSION, "nope:k1:zz"):
             assert c.decrypt(value) == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [f"{VERSION}:", f"{VERSION}:k1", f"{VERSION}:k1:", f"{VERSION}:BADKEY:zzz", f"{VERSION}:{'k' * 17}:zzz"],
+    )
+    def test_a_malformed_value_in_the_format_raises_rather_than_passing_through(self, value):
+        with pytest.raises(CryptoError):
+            crypto().decrypt(value)
+        with pytest.raises(CryptoError):
+            key_id_of(value)
+        assert is_encrypted(value) is True
 
     def test_is_encrypted_agrees_with_the_passthrough_rule(self):
         assert is_encrypted(crypto().encrypt("x")) is True

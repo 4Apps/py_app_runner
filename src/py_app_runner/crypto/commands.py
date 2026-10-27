@@ -92,18 +92,23 @@ async def cmd_rotate(
     id_ident = sql.Identifier(id_column)
     column_ident = sql.Identifier(column)
 
-    # The first page has no cursor. `id > NULL` is unknown rather than true, so it would
-    # match no rows and the whole rotate would report an empty table; the guard makes the
-    # predicate short-circuit instead of writing a second query for the first page.
-    read = sql.SQL(
-        "SELECT {id} AS id, {col} AS value FROM {rel} "
-        "WHERE (%(cursor)s IS NULL OR {id} > %(cursor)s) ORDER BY {id} LIMIT %(batch)s"
-    ).format(id=id_ident, col=column_ident, rel=relation)
-    write = sql.SQL("UPDATE {rel} SET {col} = %s WHERE {id} = %s").format(rel=relation, col=column_ident, id=id_ident)
+    # The first page has no cursor, and gets its own statement: a NULL bound in a guard like
+    # `%s IS NULL` has nothing to infer a type from, and Postgres refuses the query.
+    read = sql.SQL("SELECT {id} AS id, {col} AS value FROM {rel} {after} ORDER BY {id} LIMIT %(batch)s")
+    first_page = read.format(id=id_ident, col=column_ident, rel=relation, after=sql.SQL(""))
+    next_page = read.format(
+        id=id_ident, col=column_ident, rel=relation, after=sql.SQL("WHERE {id} > %(cursor)s").format(id=id_ident)
+    )
+    # Conditional on the value read, so an application write that lands mid-run is kept
+    # rather than overwritten with the re-encrypted old value.
+    write = sql.SQL("UPDATE {rel} SET {col} = %s WHERE {id} = %s AND {col} = %s").format(
+        rel=relation, col=column_ident, id=id_ident
+    )
 
     cursor: object = None
     seen = 0
     rotated = 0
+    changed = 0
     plaintext = 0
 
     while True:
@@ -112,7 +117,7 @@ async def cmd_rotate(
                 # Keyset pagination rather than OFFSET: OFFSET re-reads and discards every
                 # row it skips, so the last page of a large table costs a full scan, and a
                 # row updated mid-run shifts the window under it.
-                await cur.execute(read, {"cursor": cursor, "batch": batch})
+                await cur.execute(first_page if cursor is None else next_page, {"cursor": cursor, "batch": batch})
                 rows = await cur.fetchall()
         except psycopg.Error as e:
             out(f"error: cannot read {table}: {e}")
@@ -128,7 +133,12 @@ async def cmd_rotate(
             if value is None or value == "":
                 continue
 
-            found = key_id_of(value)
+            try:
+                found = key_id_of(value)
+            except CryptoError as e:
+                out(f"error: {id_column} {row_id}: {e}")
+                return 1
+
             if found is None:
                 plaintext += 1
                 continue
@@ -136,8 +146,8 @@ async def cmd_rotate(
             if found == current:
                 continue
 
-            rotated += 1
             if dry_run:
+                rotated += 1
                 continue
 
             try:
@@ -148,10 +158,16 @@ async def cmd_rotate(
 
             try:
                 async with conn.cursor() as cur:
-                    await cur.execute(write, (fresh, row_id))
+                    await cur.execute(write, (fresh, row_id, value))
+                    written = cur.rowcount
             except psycopg.Error as e:
                 out(f"error: {id_column} {row_id}: {e}")
                 return 1
+
+            if written == 0:
+                changed += 1
+            else:
+                rotated += 1
 
         if len(rows) < batch:
             break
@@ -160,5 +176,7 @@ async def cmd_rotate(
     if plaintext > 0:
         out(f"{plaintext} were not encrypted and were left alone.")
     out(f"{rotated} would be re-encrypted." if dry_run else f"{rotated} re-encrypted.")
+    if changed > 0:
+        out(f"{changed} were written by someone else while this ran and were left alone.")
 
     return 0

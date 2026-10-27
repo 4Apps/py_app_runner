@@ -4,7 +4,8 @@
 # Usage: bump_version.bash [major|minor]
 #
 # Reads version from .version (format: X.Y)
-# The patch part is not stored here - CI appends the git commit count at build time
+# The patch part is not stored here - scripts/version.bash derives it from the release tags,
+# so a new minor starts at .0
 
 BASE_PATH="$(git rev-parse --show-toplevel)"
 VERSION_FILE="$BASE_PATH/.version"

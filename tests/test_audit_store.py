@@ -127,6 +127,49 @@ class TestUpdate:
         assert len(rows) == 2
         assert {r["entity_id"] for r in rows} == {"1", "2"}
 
+    async def test_the_rows_read_before_the_write_stay_locked_until_commit(self, conn, db_dsn):
+        """Otherwise a concurrent writer landing between the read and the UPDATE makes the
+        recorded old values ones the UPDATE never replaced."""
+
+        async with conn.cursor() as cur:
+            await cur.execute("INSERT INTO people (name, status) VALUES ('Anna', 'active') RETURNING id")
+            person_id = (await cur.fetchone())[0]
+
+        probes: list[bool] = []
+        async with await psycopg.AsyncConnection.connect(db_dsn, autocommit=True) as other:
+
+            async def probe() -> None:
+                try:
+                    await other.execute("SELECT 1 FROM people WHERE id = %s FOR UPDATE NOWAIT", (person_id,))
+                    probes.append(False)
+                except psycopg.errors.LockNotAvailable:
+                    probes.append(True)
+
+            async with conn.transaction(), conn.cursor() as cur:
+                await Audit().update(
+                    ProbeAfterFirstStatement(cur, probe), "people", {"status": "left"}, {"id": person_id}
+                )
+
+        assert probes == [True]
+
+
+class ProbeAfterFirstStatement:
+    """Runs `probe` once, right after the first statement - the read of the affected rows."""
+
+    def __init__(self, cur, probe) -> None:
+        self._cur = cur
+        self._probe = probe
+
+    async def execute(self, query, params=None):
+        result = await self._cur.execute(query, params)
+        if self._probe is not None:
+            probe, self._probe = self._probe, None
+            await probe()
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
 
 class TestDelete:
     async def test_records_the_whole_row_it_removed(self, conn):
@@ -187,6 +230,42 @@ class TestRedaction:
         row = (await trail(conn))[0]
         assert row["new_values"] == {"password": "***"}
         assert "new" not in json.dumps(row["new_values"])
+
+    async def test_a_qualified_or_differently_cased_name_is_still_redacted(self, conn):
+        audit = Audit(exclude={"People": ["Password"]})
+
+        async with conn.cursor() as cur:
+            await cur.execute("INSERT INTO people (name, password) VALUES ('Anna', 'old') RETURNING id")
+            person_id = (await cur.fetchone())[0]
+
+            await audit.update(cur, "public.people", {"password": "new"}, {"id": person_id})
+
+        row = (await trail(conn))[0]
+        assert row["old_values"] == {"password": "***"}
+        assert row["new_values"] == {"password": "***"}
+
+    async def test_record_redacts_a_hand_built_event(self, conn):
+        audit = Audit(exclude={"people": ["password"]})
+
+        async with conn.cursor() as cur:
+            await audit.record(
+                cur,
+                AuditEvent(event="imported", entity_type="people", new_values={"name": "Anna", "password": "hash"}),
+            )
+
+        assert (await trail(conn))[0]["new_values"] == {"name": "Anna", "password": "***"}
+
+    @pytest.mark.parametrize(
+        ("key", "table", "redacted"),
+        [
+            ("people", "hr.people", True),
+            ("hr.people", "HR.People", True),
+            ("hr.people", "people", True),
+            ("hr.people", "public.people", False),
+        ],
+    )
+    def test_a_schema_qualified_key_covers_only_its_schema(self, key, table, redacted):
+        assert (Audit(exclude={key: ["password"]}).excluded(table) == ["password"]) is redacted
 
     async def test_a_malformed_exclude_block_is_refused_at_construction(self):
         """Redaction fails open by its nature: a lookup finding nothing to exclude simply

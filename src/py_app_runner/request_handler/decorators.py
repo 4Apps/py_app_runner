@@ -9,10 +9,10 @@ from typing_extensions import ParamSpec
 
 from py_app_runner.db_pools import make_db_wrapper
 from py_app_runner.http_exception import HTTPException
+from py_app_runner.registry import AppRegistry
 from py_app_runner.request_handler.handlers import RequestHandlerHelper
 from py_app_runner.throttle import Throttle
 
-rate_limit_logger = logging.getLogger(__name__ + ".rate_limit")
 audit_logger = logging.getLogger(__name__ + ".audit")
 
 P = ParamSpec("P")
@@ -59,13 +59,31 @@ def authenticated(func: AsyncMethod) -> AsyncMethod:
 
 def require_auth_for_actions(cls: T) -> T:
     """
-    Class decorator: wraps every method that has `_action_name` with @authenticated.
+    Class decorator: wraps every method that has `_action_name` with @authenticated,
+    on this class and on every subclass of it.
 
     Walks the full MRO, not just `vars(cls)`: dispatch in RequestHandlerHelper resolves
     actions via `dir()`, so inherited @action methods are routable and must be guarded
-    as well.
+    as well. Subclasses are guarded through `__init_subclass__`, since an action they add
+    or override is a new, unwrapped function.
     """
 
+    _guard_actions(cls)
+
+    own_hook = cls.__dict__.get("__init_subclass__")
+
+    def __init_subclass__(subclass: type, **kwargs: Any) -> None:
+        if own_hook is not None:
+            own_hook.__func__(subclass, **kwargs)
+        else:
+            super(cls, subclass).__init_subclass__(**kwargs)  # pyrefly: ignore[invalid-argument]
+        _guard_actions(subclass)
+
+    cls.__init_subclass__ = classmethod(__init_subclass__)  # type: ignore[assignment]
+    return cls
+
+
+def _guard_actions(cls: type) -> None:
     for name in dir(cls):
         attr = getattr(cls, name, None)
         action_name = getattr(attr, "_action_name", None)
@@ -79,8 +97,6 @@ def require_auth_for_actions(cls: T) -> T:
         wrapped = authenticated(attr)  # type: ignore[reportUnknownLambdaType]
         cast(object, wrapped)._action_name = action_name  # type: ignore[attr-defined]
         setattr(cls, name, wrapped)
-
-    return cls
 
 
 _DB_ATTRS = ("db_conn", "db_cur", "pg_conn", "pg_cur", "db_wrapper")
@@ -211,8 +227,7 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
         async def wrapper(self: SelfT, *args: P.args, **kwargs: P.kwargs) -> R:  # pyrefly: ignore[not-a-type]
             redis_con = getattr(self, "redis_con", None)
             if redis_con is None:
-                rate_limit_logger.warning("rate_limit requires Redis; skipping enforcement")
-                return await func(self, *args, **kwargs)
+                raise RuntimeError("@rate_limit must be applied after @with_cache or @with_cache_and_db")
 
             bh = getattr(self, "bridge_handler", None)
             user = getattr(bh, "current_user", None) if bh else None
@@ -220,7 +235,7 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
             if user and getattr(user, "id", None):
                 identity = f"user:{user.id}"
             elif bh:
-                identity = f"ip:{bh.request.remote_ip}"
+                identity = f"ip:{bh.client_ip()}"
             else:
                 identity = "unknown"
 
@@ -230,7 +245,7 @@ def rate_limit(max_requests: int, window_seconds: int) -> Callable[[AsyncMethod]
             scope = f"{type(self).__module__}.{type(self).__qualname__}"
             key = f"rl:{scope}:{action_name}:{identity}"
 
-            attempt = await Throttle(redis_con).hit(key, max_requests, window_seconds)
+            attempt = await Throttle.from_config(redis_con, AppRegistry.config()).hit(key, max_requests, window_seconds)
 
             if not attempt.allowed:
                 raise HTTPException(
@@ -283,7 +298,7 @@ def audited(
                 ip: str | None = None
                 user_agent: str | None = None
                 if bh:
-                    ip = bh.request.remote_ip
+                    ip = bh.client_ip()
                     user_agent = bh.request.headers.get("User-Agent")
 
                 # Build details from input_data (first positional arg after self)

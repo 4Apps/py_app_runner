@@ -33,10 +33,10 @@ jobs:
       # Mandatory for trusted publishing; no API token is stored anywhere
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          # scripts/version.bash derives the patch from the commit count, so it needs the
-          # full history - a shallow clone would silently produce version .1
+          # scripts/version.bash derives the patch from the release tags and the dev number
+          # from the history since the newest one; a shallow clone has neither
           fetch-depth: 0
 
       - name: Resolve dev version
@@ -46,7 +46,7 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Publishing py_app_runner $VERSION"
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.x"
 
@@ -72,9 +72,9 @@ jobs:
       - name: Check distributions
         run: twine check --strict dist/*
 
-      # skip-existing because the commit count does not move on a re-run or a forced push
-      # that lands the same history; that is not worth failing a dev build over
+      # skip-existing because the dev number does not move on a re-run, and repeats after a
+      # forced push that shortens history; that is not worth failing a dev build over
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           skip-existing: true

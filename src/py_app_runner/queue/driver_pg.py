@@ -9,6 +9,7 @@ rather than somewhere faster.
 
 import datetime
 import json
+import logging
 import re
 from typing import Any
 
@@ -31,6 +32,14 @@ CLAIM_ROUNDS = 5
 MAX_ERROR_BYTES = 60000
 
 _JOB_COLUMNS = "id, queue, name, payload, attempts, max_attempts, priority, unique_key"
+
+# Each claim increments attempts, so the pair names one claim rather than one worker.
+_OWNED = sql.SQL("reserved_by = %s AND attempts = %s")
+_EXHAUSTED = sql.SQL("attempts >= max_attempts AND (reserved_until IS NULL OR reserved_until <= %s)")
+
+EXHAUSTED_ERROR = "Exceeded max attempts: the last attempt released the job, or its worker died before finishing it."
+
+_logger = logging.getLogger(__name__)
 
 
 def assert_table_name(table: str) -> str:
@@ -86,6 +95,17 @@ def now_utc() -> datetime.datetime:
     """
 
     return datetime.datetime.now(datetime.UTC)
+
+
+def _stale(action: str, job: Job) -> None:
+    _logger.warning(
+        "Queue %s of job %s #%s ignored: %s no longer holds attempt %s, another worker took it over",
+        action,
+        job.name,
+        job.id,
+        job.reserved_by,
+        job.attempts,
+    )
 
 
 class PgQueue:
@@ -205,9 +225,17 @@ class PgQueue:
             # transaction open for the length of a job is how a queue takes a database down
             # with it.
             async with self.conn.transaction():
-                candidate = await self._candidate(queue, moment)
-                if candidate is None:
+                found = await self._candidate(queue, moment)
+                if found is None:
                     return None
+
+                candidate, exhausted = found
+                if exhausted:
+                    # The worker's own out-of-attempts check only runs when a handler raises.
+                    # A handler that kills its worker comes back here instead, and handing it
+                    # out again would retry it forever, ahead of new work.
+                    await self._move_to_failed(candidate, _EXHAUSTED, (moment,), EXHAUSTED_ERROR)
+                    continue
 
                 claimed = await self._claim(candidate, until, worker, moment)
                 if not claimed:
@@ -220,20 +248,25 @@ class PgQueue:
             if row is None:
                 continue
 
-            job = self._to_job(row)
+            job = self._to_job(row, worker[:64])
             if job is None:
                 # Undecodable payload. It is not going to decode on the next attempt either,
                 # so it goes straight to failed rather than burning its budget first.
-                await self._fail_row(row, "Payload is not valid JSON, so no handler could be given it.")
+                await self._move_to_failed(
+                    int(row["id"]),
+                    _OWNED,
+                    (worker[:64], int(row["attempts"])),
+                    "Payload is not valid JSON, so no handler could be given it.",
+                )
                 continue
 
             return job
 
         return None
 
-    async def _candidate(self, queue: str, moment: datetime.datetime) -> int | None:
+    async def _candidate(self, queue: str, moment: datetime.datetime) -> tuple[int, bool] | None:
         statement = sql.SQL(
-            "SELECT id FROM {rel} "
+            "SELECT id, attempts >= max_attempts FROM {rel} "
             "WHERE queue = %s AND available_at <= %s "
             "  AND (reserved_until IS NULL OR reserved_until <= %s) "
             "ORDER BY priority DESC, available_at, id "
@@ -243,7 +276,7 @@ class PgQueue:
         async with self.conn.cursor() as cur:
             await cur.execute(statement, (queue, moment, moment))
             row = await cur.fetchone()
-            return int(row[0]) if row else None
+            return (int(row[0]), bool(row[1])) if row else None
 
     async def _claim(self, job_id: int, until: datetime.datetime, worker: str, moment: datetime.datetime) -> bool:
         """The guarded update.
@@ -274,7 +307,7 @@ class PgQueue:
 
             return dict(zip(column_names(cur), row, strict=True))
 
-    def _to_job(self, row: dict[str, Any]) -> Job | None:
+    def _to_job(self, row: dict[str, Any], reserved_by: str) -> Job | None:
         try:
             payload = json.loads(row["payload"])
         except (TypeError, ValueError):
@@ -291,6 +324,7 @@ class PgQueue:
             payload_json=row["payload"],
             attempts=int(row["attempts"]),
             max_attempts=int(row["max_attempts"]),
+            reserved_by=reserved_by,
         )
 
     ##################
@@ -298,57 +332,53 @@ class PgQueue:
     ##################
 
     async def delete(self, job: Job) -> None:
-        statement = sql.SQL("DELETE FROM {rel} WHERE id = %s").format(rel=_qualified(self.table))
+        statement = sql.SQL("DELETE FROM {rel} WHERE id = %s AND {owned}").format(
+            rel=_qualified(self.table), owned=_OWNED
+        )
 
         async with self.conn.cursor() as cur:
-            await cur.execute(statement, (job.id,))
+            await cur.execute(statement, (job.id, job.reserved_by, job.attempts))
+            if cur.rowcount != 1:
+                _stale("delete", job)
 
     async def release(self, job: Job, delay: int = 0, error: str = "") -> None:
         """Put a job back. `attempts` is untouched - the claim already counted it."""
 
         statement = sql.SQL(
             "UPDATE {rel} SET reserved_until = NULL, reserved_by = NULL, available_at = %s, last_error = %s "
-            "WHERE id = %s"
-        ).format(rel=_qualified(self.table))
+            "WHERE id = %s AND {owned}"
+        ).format(rel=_qualified(self.table), owned=_OWNED)
 
         available = now_utc() + datetime.timedelta(seconds=max(0, delay))
 
         async with self.conn.cursor() as cur:
-            await cur.execute(statement, (available, fit_error(error), job.id))
+            await cur.execute(statement, (available, fit_error(error), job.id, job.reserved_by, job.attempts))
+            if cur.rowcount != 1:
+                _stale("release", job)
 
     async def fail(self, job: Job, error: str) -> None:
-        await self._move_to_failed(
-            job_id=job.id,
-            queue=job.queue,
-            name=job.name,
-            payload=job.payload_json,
-            attempts=job.attempts,
-            error=error,
-        )
+        if not await self._move_to_failed(job.id, _OWNED, (job.reserved_by, job.attempts), error):
+            _stale("fail", job)
 
-    async def _fail_row(self, row: dict[str, Any], error: str) -> None:
-        await self._move_to_failed(
-            job_id=int(row["id"]),
-            queue=row["queue"],
-            name=row["name"],
-            payload=row["payload"],
-            attempts=int(row["attempts"]),
-            error=error,
+    async def _move_to_failed(self, job_id: int, guard: sql.Composable, params: tuple[Any, ...], error: str) -> bool:
+        delete = sql.SQL("DELETE FROM {rel} WHERE id = %s AND {guard} RETURNING queue, name, payload, attempts").format(
+            rel=_qualified(self.table), guard=guard
         )
-
-    async def _move_to_failed(
-        self, job_id: int, queue: str, name: str, payload: str, attempts: int, error: str
-    ) -> None:
         insert = sql.SQL(
             "INSERT INTO {rel} (queue, name, payload, attempts, error, failed_at) VALUES (%s, %s, %s, %s, %s, %s)"
         ).format(rel=_qualified(self.failed_table))
-        delete = sql.SQL("DELETE FROM {rel} WHERE id = %s").format(rel=_qualified(self.table))
 
         # One transaction so a job cannot be in both tables or neither.
         async with self.conn.transaction():
             async with self.conn.cursor() as cur:
-                await cur.execute(insert, (queue, name, payload, attempts, fit_error(error), now_utc()))
-                await cur.execute(delete, (job_id,))
+                await cur.execute(delete, (job_id, *params))
+                row = await cur.fetchone()
+                if row is None:
+                    return False
+
+                await cur.execute(insert, (*row, fit_error(error), now_utc()))
+
+        return True
 
     ###############
     ### Reports ###

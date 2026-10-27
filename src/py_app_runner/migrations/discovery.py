@@ -7,6 +7,7 @@ from datetime import datetime
 
 MIGRATION_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{6})-([a-z0-9-]+)\.sql$")
 NO_TRANSACTION_DIRECTIVE = "-- migrations:no-transaction"
+FOREIGN_KEYS_OFF_DIRECTIVE = "-- migrations:foreign-keys-off"
 
 # psql meta-commands. pg_dump emits \restrict / \unrestrict, and psycopg sends SQL to the
 # server directly - there is no psql to interpret these, so they arrive as syntax errors.
@@ -27,6 +28,7 @@ class MigrationFile:
     sql: str
     checksum: str
     no_transaction: bool
+    foreign_keys_off: bool = False
 
 
 def checksum_bytes(data: bytes) -> str:
@@ -53,6 +55,7 @@ def load_migration(path: pathlib.Path) -> MigrationFile:
         sql=sql,
         checksum=checksum_bytes(raw),
         no_transaction=first_line == NO_TRANSACTION_DIRECTIVE,
+        foreign_keys_off=first_line == FOREIGN_KEYS_OFF_DIRECTIVE,
     )
 
 

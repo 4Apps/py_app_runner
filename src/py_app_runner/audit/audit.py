@@ -13,6 +13,7 @@ without hand-written before-fetches at every call site.
 """
 
 import logging
+from dataclasses import replace
 from typing import Any
 
 import psycopg
@@ -24,6 +25,8 @@ from py_app_runner.audit.event import CREATED, DELETED, UPDATED, AuditEvent, cur
 from py_app_runner.audit.store import Store, assert_table_name, qualified
 
 _logger = logging.getLogger(__name__)
+
+TableKey = tuple[str | None, str]
 
 _DEFAULTS: dict[str, Any] = {
     "table": "audit_log",
@@ -68,7 +71,7 @@ class Audit:
             exclude=settings["exclude"] or {},
         )
 
-    def _validated_exclude(self, exclude: dict[str, list[str]]) -> dict[str, list[str]]:
+    def _validated_exclude(self, exclude: dict[str, list[str]]) -> dict[TableKey, set[str]]:
         """Reject a malformed exclude block at construction.
 
         Redaction fails open by its nature: a lookup that finds nothing to exclude simply
@@ -91,17 +94,46 @@ class Audit:
                     f"got {columns!r}. Anything unreadable here is a redaction that will not happen."
                 )
 
-        return {table: list(columns) for table, columns in exclude.items()}
+        normalised: dict[TableKey, set[str]] = {}
+        for table, columns in exclude.items():
+            normalised.setdefault(_table_key(str(table)), set()).update(c.lower() for c in columns)
+
+        return normalised
 
     def excluded(self, table: str) -> list[str]:
-        return self.exclude.get(table, [])
+        """Columns to redact for `table`, case-insensitively.
+
+        A bare key covers the table in every schema, and a schema-qualified key only its own
+        schema. An unqualified `table` is matched by both, since search_path decides which
+        schema it is and a lookup that guesses wrong leaks.
+        """
+
+        schema, name = _table_key(table)
+        columns: set[str] = set()
+        for (key_schema, key_name), key_columns in self.exclude.items():
+            if key_name == name and (key_schema is None or schema is None or key_schema == schema):
+                columns |= key_columns
+
+        return sorted(columns)
 
     ################
     ### Recording ##
     ################
 
     async def record(self, cur: psycopg.AsyncCursor, event: AuditEvent) -> None:
-        """Write one event, on the caller's cursor and inside the caller's transaction."""
+        """Write one event, on the caller's cursor and inside the caller's transaction.
+
+        The single place excluded columns are redacted, so an event built by hand gets the
+        same treatment as one from the wrappers.
+        """
+
+        excluded = self.excluded(event.entity_type)
+        if excluded:
+            event = replace(
+                event,
+                old_values=diff.mask(event.old_values, excluded) if event.old_values is not None else None,
+                new_values=diff.mask(event.new_values, excluded) if event.new_values is not None else None,
+            )
 
         try:
             await self.store.write(cur, event.with_resolved(current_context()))
@@ -160,7 +192,7 @@ class Audit:
         returned = await cur.fetchone()
         new_id = returned[0] if returned else None
 
-        _, new_values = diff.between(None, data, self.excluded(table))
+        _, new_values = diff.between(None, data)
 
         await self.record(
             cur,
@@ -207,9 +239,8 @@ class Audit:
             # Not an error, but it is what a mistyped condition looks like.
             _logger.debug("Audit trail: update on %r matched no rows", table)
 
-        excluded = self.excluded(table)
         for row in rows:
-            old_values, new_values = diff.between(row, data, excluded)
+            old_values, new_values = diff.between(row, data)
             if new_values is None:
                 continue
 
@@ -258,9 +289,8 @@ class Audit:
         await cur.execute(statement, tuple(where.values()))
         affected = cur.rowcount
 
-        excluded = self.excluded(table)
         for row in rows:
-            old_values, _ = diff.between(row, None, excluded)
+            old_values, _ = diff.between(row, None)
 
             await self.record(
                 cur,
@@ -287,7 +317,9 @@ class Audit:
     async def _rows(self, cur: psycopg.AsyncCursor, table: str, where: dict[str, Any]) -> list[dict[str, Any]]:
         """Read the rows a change is about to affect, as dicts."""
 
-        statement = sql.SQL("SELECT * FROM {rel}{cond}").format(
+        # Locked, so a concurrent writer cannot change a row between this read and the write
+        # it precedes - the old values recorded are the ones the write replaced.
+        statement = sql.SQL("SELECT * FROM {rel}{cond} FOR UPDATE").format(
             rel=qualified(table),
             cond=sql.SQL(" WHERE ") + self._condition(where) if where else sql.SQL(""),
         )
@@ -317,3 +349,8 @@ class Audit:
                 f"the limit."
             )
         )
+
+
+def _table_key(table: str) -> TableKey:
+    schema, _, name = table.lower().rpartition(".")
+    return (schema or None, name)
