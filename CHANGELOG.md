@@ -5,6 +5,8 @@ must act on. Versions missing from the list were never published.
 
 ## Unreleased
 
+## v0.7.1 - 2026-10-27
+
 - Dependencies: `database_wrapper == 0.4.0` (brings `aiosqlite >= 0.17.0`)
 
 ## v0.7.0 - 2026-10-27
