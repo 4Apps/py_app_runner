@@ -5,6 +5,8 @@ must act on. Versions missing from the list were never published.
 
 ## Unreleased
 
+- Dependencies: `database_wrapper == 0.4.0` (brings `aiosqlite >= 0.17.0`)
+
 ## v0.7.0 - 2026-10-27
 
 - **Breaking:** a non-empty queue `handlers` map is an allow-list; a job name outside it fails instead of being imported
