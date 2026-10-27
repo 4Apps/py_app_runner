@@ -5,6 +5,8 @@ must act on. Versions missing from the list were never published.
 
 ## Unreleased
 
+- A project service shadows the built-in of the same name; a project `cron` no longer imports `py_app_runner.cron` (needed the `cron` extra)
+
 ## v0.7.1 - 2026-10-27
 
 - Dependencies: `database_wrapper == 0.4.0` (brings `aiosqlite >= 0.17.0`)

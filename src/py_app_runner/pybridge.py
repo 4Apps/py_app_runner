@@ -1,7 +1,23 @@
+import sys
 from importlib import import_module
+from importlib.util import find_spec
 from typing import Any, Literal
 
 from py_app_runner.db_pools import DbPools
+
+_ENTRY_MODULES = ("_service", "_service_args", "_service_pybridge")
+
+
+def _module_exists(module_name: str) -> bool:
+    """Whether `module_name` can be imported, without executing it."""
+
+    if module_name in sys.modules:
+        return True
+
+    try:
+        return find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
 
 
 class PyBridge:
@@ -27,15 +43,20 @@ class PyBridge:
             raise
 
     def _resolve(self, service_name: str, module: str) -> Any | Literal[False]:
-        """Project services win over built-ins, so a project can override `bridge` or
-        `migrations` by shipping its own `services.<name>.<module>`."""
+        """A project package with any entry module owns the service name outright, so a
+        built-in of the same name is never mixed in or imported. A project package without
+        one (`services/bridge` holding only routes) extends the built-in instead."""
 
-        for package in (f"services.{service_name}", f"py_app_runner.{service_name}"):
-            found = self._import_or_none(f"{package}.{module}")
-            if found is not None:
-                return found
+        project = f"services.{service_name}"
+        found = self._import_or_none(f"{project}.{module}")
+        if found is not None:
+            return found
 
-        return False
+        if any(_module_exists(f"{project}.{entry}") for entry in _ENTRY_MODULES):
+            return False
+
+        found = self._import_or_none(f"py_app_runner.{service_name}.{module}")
+        return found if found is not None else False
 
     def load_service(self, service_name: str) -> Any:
         service = self._resolve(service_name, "_service")

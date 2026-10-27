@@ -105,7 +105,9 @@ Client (HTTP or WS)
 - **`runner.py`** — CLI entrypoint (`main()`): args, logging/Sentry, service loading, event loop (uvloop in prod).
 - **`pybridge.py`** — Dynamic loader. `services.<name>._service` / `_service_args` /
   `_service_pybridge`, falling back to `py_app_runner.<name>.<module>` for built-ins (`bridge`,
-  `migrations`). Project services win, so a project can override a built-in by name.
+  `migrations`). A project package with any of
+  `_service`/`_service_args`/`_service_pybridge` owns the name and the built-in is never imported;
+  one without (`services/bridge` holding only routes) extends the built-in.
 - **`registry.py`** — `AppRegistry` singleton (config, models, Redis channel, web app class). Configure before start.
 - **`config.py`** — `load_config()` maps `ENV_VAR` names into nested dict keys by splitting on
   `_`; only vars whose first key exists in defaults are processed. `is_env_dev/test/prod`.

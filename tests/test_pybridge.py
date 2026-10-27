@@ -37,12 +37,36 @@ def test_project_service_wins_over_builtin(fake_modules):
     assert PyBridge().load_service_args("demo").origin == "project"
 
 
-def test_falls_back_to_builtin_when_project_module_absent(fake_modules):
+def test_falls_back_to_builtin_when_project_has_no_entry_module(fake_modules):
+    fake_modules("services")
+    fake_modules("services.demo")
+    fake_modules("services.demo.routes")
     fake_modules("py_app_runner.demo")
     builtin = fake_modules("py_app_runner.demo._service_args")
     builtin.origin = "builtin"
 
     assert PyBridge().load_service_args("demo").origin == "builtin"
+
+
+def test_project_service_shadows_builtin_of_the_same_name(fake_modules, monkeypatch):
+    """A project `services/cron` without a pybridge must not reach `py_app_runner.cron`,
+    whose package refuses to import without the `cron` extra."""
+
+    import py_app_runner.pybridge as pybridge_module
+
+    fake_modules("services")
+    fake_modules("services.demo")
+    fake_modules("services.demo._service_args")
+    real_import_module = pybridge_module.import_module
+
+    def fake_import_module(name: str, *args, **kwargs):
+        if name.startswith("py_app_runner.demo"):
+            raise ImportError("py_app_runner.demo requires an extra")
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(pybridge_module, "import_module", fake_import_module)
+
+    assert PyBridge().load_service_pybridge("demo") is False
 
 
 def test_returns_false_when_neither_leg_exists(fake_modules):
