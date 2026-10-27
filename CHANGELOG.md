@@ -5,6 +5,8 @@ must act on. Versions missing from the list were never published.
 
 ## Unreleased
 
+## v0.7.0 - 2026-10-27
+
 - **Breaking:** a non-empty queue `handlers` map is an allow-list; a job name outside it fails instead of being imported
 - **Breaking:** `max_body_size` defaults to 10 MiB instead of tornado's 100 MB
 - **Breaking:** `@rate_limit` raises `RuntimeError` without `redis_con` instead of silently not limiting
