@@ -5,6 +5,7 @@ import pathlib
 import psycopg
 import pytest
 import pytest_asyncio
+from psycopg.rows import dict_row
 
 from py_app_runner.audit import Actor, Audit, AuditError, AuditEvent, request_context
 from py_app_runner.audit.commands import cmd_install, cmd_prune
@@ -73,6 +74,23 @@ class TestInsert:
             new_id = await audit.insert(cur, "people", {"name": "Anna"})
 
         assert (await trail(conn))[0]["entity_id"] == str(new_id)
+
+
+class TestDictRowCursor:
+    async def test_a_dict_row_cursor_records_the_same_trail(self, conn):
+        audit = Audit()
+
+        async with conn.cursor(row_factory=dict_row) as cur:
+            new_id = await audit.insert(cur, "people", {"name": "Anna", "status": "new"})
+            await audit.update(cur, "people", {"status": "active"}, {"id": new_id})
+            await audit.delete(cur, "people", {"id": new_id})
+
+        created, updated, deleted = await trail(conn)
+        assert isinstance(new_id, int)
+        assert {row["entity_id"] for row in (created, updated, deleted)} == {str(new_id)}
+        assert updated["old_values"] == {"status": "new"}
+        assert updated["new_values"] == {"status": "active"}
+        assert deleted["old_values"]["name"] == "Anna"
 
 
 class TestUpdate:

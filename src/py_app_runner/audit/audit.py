@@ -13,6 +13,7 @@ without hand-written before-fetches at every call site.
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -190,7 +191,7 @@ class Audit:
 
         await cur.execute(statement, tuple(data[c] for c in columns))
         returned = await cur.fetchone()
-        new_id = returned[0] if returned else None
+        new_id = _as_dict([self.id_key], returned)[self.id_key] if returned else None
 
         _, new_values = diff.between(None, data)
 
@@ -329,7 +330,7 @@ class Audit:
             return []
 
         names = [d.name for d in cur.description]
-        return [dict(zip(names, row, strict=True)) for row in await cur.fetchall()]
+        return [_as_dict(names, row) for row in await cur.fetchall()]
 
     def _row_id(self, row: dict[str, Any]) -> str:
         value = row.get(self.id_key)
@@ -349,6 +350,16 @@ class Audit:
                 f"the limit."
             )
         )
+
+
+def _as_dict(names: list[str], row: Any) -> dict[str, Any]:
+    """The caller's cursor decides the row shape: a sequence by default, a mapping under
+    psycopg's `dict_row`."""
+
+    if isinstance(row, Mapping):
+        return dict(row)
+
+    return dict(zip(names, row, strict=True))
 
 
 def _table_key(table: str) -> TableKey:

@@ -5,6 +5,8 @@ must act on. Versions missing from the list were never published.
 
 ## Unreleased
 
+- Audit `insert`/`update`/`delete` work on a `dict_row` cursor; insert raised and update/delete recorded column names as values
+
 ## v0.7.2 - 2026-10-27
 
 - A project service shadows the built-in of the same name; a project `cron` no longer imports `py_app_runner.cron` (needed the `cron` extra)
