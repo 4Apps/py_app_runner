@@ -5,6 +5,8 @@ must act on. Versions missing from the list were never published.
 
 ## Unreleased
 
+## v0.7.3 - 2026-11-12
+
 - Audit `insert`/`update`/`delete` work on a `dict_row` cursor; insert raised and update/delete recorded column names as values
 
 ## v0.7.2 - 2026-10-27
