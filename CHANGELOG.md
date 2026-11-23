@@ -5,6 +5,8 @@ must act on. Versions missing from the list were never published.
 
 ## Unreleased
 
+## v0.7.4 - 2026-11-23
+
 - Postgres-only commands (migrations, api_keys, audit, cron, queue, crypto) accept a callable `password` and pass the database's `kwargs` (hostaddr, sslrootcert...) to the connection
 
 ## v0.7.3 - 2026-11-12
