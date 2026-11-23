@@ -42,7 +42,7 @@ async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Log
             raise SystemExit(2)
 
         if args.step == "rotate":
-            async with await psycopg.AsyncConnection.connect(**connect_kwargs(db_config[db_name])) as conn:
+            async with await psycopg.AsyncConnection.connect(**await connect_kwargs(db_config[db_name])) as conn:
                 code = await cmd_rotate(
                     conn,
                     crypto,

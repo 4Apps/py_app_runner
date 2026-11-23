@@ -100,7 +100,7 @@ async def _job_lock(db_config: dict[str, Any]) -> AsyncIterator[Lock]:
         yield FileLock(str(db_config["database"]))
         return
 
-    async with await psycopg.AsyncConnection.connect(**connect_kwargs(db_config)) as conn:
+    async with await psycopg.AsyncConnection.connect(**await connect_kwargs(db_config)) as conn:
         yield PgLock(conn)
 
 

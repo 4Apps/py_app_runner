@@ -213,6 +213,6 @@ class TestConfig:
         with pytest.raises(MigrationError, match="same physical database"):
             resolve_targets(config)
 
-    def test_postgres_only_commands_refuse_a_sqlite_database(self, db_config):
+    async def test_postgres_only_commands_refuse_a_sqlite_database(self, db_config):
         with pytest.raises(ValueError, match="needs Postgres"):
-            connect_kwargs(db_config)
+            await connect_kwargs(db_config)

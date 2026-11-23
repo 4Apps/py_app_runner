@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import pathlib
@@ -32,7 +33,7 @@ _DEFAULT_TABLE = "migrations"
 _DEFAULT_TARGET_NAME = "main"
 
 
-def connect_kwargs(db_config: dict[str, Any]) -> dict[str, Any]:
+async def connect_kwargs(db_config: dict[str, Any]) -> dict[str, Any]:
     """PgsqlConfig uses hostname/username/database; psycopg wants host/user/dbname.
 
     autocommit is on because this service manages transactions per migration file
@@ -41,6 +42,9 @@ def connect_kwargs(db_config: dict[str, Any]) -> dict[str, Any]:
 
     Every Postgres-only command (queue, audit, api_keys, crypto) connects through here, so
     this is where a SQLite database is turned away.
+
+    As for the pool, `password` may be a sync or async callable (a short-lived token) and
+    `kwargs` carries extra libpq parameters such as hostaddr or sslrootcert.
     """
 
     if db_driver(db_config) != PGSQL:
@@ -48,11 +52,18 @@ def connect_kwargs(db_config: dict[str, Any]) -> dict[str, Any]:
             f"This command needs Postgres; the configured database uses the {db_driver(db_config)!r} driver"
         )
 
+    password = db_config["password"]
+    if callable(password):
+        password = password()
+        if inspect.isawaitable(password):
+            password = await password
+
     return {
+        **(db_config.get("kwargs") or {}),
         "host": db_config["hostname"],
         "port": db_config.get("port") or 5432,
         "user": db_config["username"],
-        "password": db_config["password"],
+        "password": password,
         "dbname": db_config["database"],
         "sslmode": db_config.get("ssl") or "prefer",
         "autocommit": True,
@@ -73,7 +84,7 @@ async def connect(db_config: dict[str, Any]) -> AsyncIterator[Connection]:
             await db.close()
         return
 
-    async with await psycopg.AsyncConnection.connect(**connect_kwargs(db_config)) as pg_conn:
+    async with await psycopg.AsyncConnection.connect(**await connect_kwargs(db_config)) as pg_conn:
         yield pg_conn
 
 

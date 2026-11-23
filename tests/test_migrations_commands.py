@@ -639,8 +639,8 @@ class TestAutocommitGuard:
 
 
 class TestServiceConfig:
-    def test_connect_kwargs_maps_pgsqlconfig_names(self):
-        assert connect_kwargs(
+    async def test_connect_kwargs_maps_pgsqlconfig_names(self):
+        assert await connect_kwargs(
             {
                 "hostname": "db.example.com",
                 "port": 5433,
@@ -659,13 +659,32 @@ class TestServiceConfig:
             "autocommit": True,
         }
 
-    def test_connect_kwargs_applies_defaults(self):
-        result = connect_kwargs(
+    async def test_connect_kwargs_applies_defaults(self):
+        result = await connect_kwargs(
             {"hostname": "db", "username": "app", "password": "s", "database": "appdb"}
         )
 
         assert result["port"] == 5432
         assert result["sslmode"] == "prefer"
+
+    async def test_connect_kwargs_resolves_a_password_callable_and_passes_pool_kwargs(self):
+        async def token() -> str:
+            return "fresh-token"
+
+        result = await connect_kwargs(
+            {
+                "hostname": "db.example.com",
+                "username": "app",
+                "password": token,
+                "database": "appdb",
+                "kwargs": {"hostaddr": "10.0.0.5", "sslrootcert": "system", "autocommit": False},
+            }
+        )
+
+        assert result["password"] == "fresh-token"
+        assert result["hostaddr"] == "10.0.0.5"
+        assert result["sslrootcert"] == "system"
+        assert result["autocommit"] is True
 
     def test_resolve_targets_default_when_config_has_no_migrations_key(self, tmp_path):
         targets = resolve_targets({"current_path": str(tmp_path)})

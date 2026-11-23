@@ -147,7 +147,7 @@ async def init_service(args: Namespace, _pybridge: PyBridge, logger: logging.Log
             )
             raise SystemExit(2)
 
-        async with await psycopg.AsyncConnection.connect(**connect_kwargs(db_config[db_name])) as conn:
+        async with await psycopg.AsyncConnection.connect(**await connect_kwargs(db_config[db_name])) as conn:
             code = await _dispatch(
                 args, settings, config, PgQueue(conn, settings["table"], settings["failed_table"]), logger, out
             )

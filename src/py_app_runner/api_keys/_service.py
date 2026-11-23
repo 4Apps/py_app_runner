@@ -73,7 +73,7 @@ async def _run(args: Namespace, config: dict, out: Out) -> int:
         out(f"error: unknown api_keys command {args.step!r}")
         return 2
 
-    async with await psycopg.AsyncConnection.connect(**connect_kwargs(db_config)) as conn:
+    async with await psycopg.AsyncConnection.connect(**await connect_kwargs(db_config)) as conn:
         if args.step == "create":
             return await cmd_create(
                 conn,
